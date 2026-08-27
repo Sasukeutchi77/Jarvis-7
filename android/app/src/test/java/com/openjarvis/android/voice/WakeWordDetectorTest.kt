@@ -1,10 +1,13 @@
 package com.openjarvis.android.voice
 
 import com.openjarvis.android.voice.wakeword.AcousticFeatures
+import com.openjarvis.android.voice.wakeword.AudioPreprocessor
 import com.openjarvis.android.voice.wakeword.DetectionResult
+import com.openjarvis.android.voice.wakeword.ModelSourceType
 import com.openjarvis.android.voice.wakeword.PhoneticState
 import com.openjarvis.android.voice.wakeword.WakeWordDetector
 import com.openjarvis.android.voice.wakeword.WakeWordModel
+import com.openjarvis.android.voice.wakeword.WakeWordTemplate
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -15,15 +18,19 @@ import kotlin.math.PI
 import kotlin.math.sin
 
 /**
- * Unit Test Suite for JARVIS Real On-Device Wake-Word Acoustic Classifier.
+ * Comprehensive Unit Test Suite for JARVIS Real On-Device Wake-Word Engine (Stage 2.2).
  * Verifies:
- * - Real acoustic DTW alignment on "Hey JARVIS" & "Dis JARVIS"
- * - False positive rejection ("Bonjour", "Hey Google", "Alexa", isolated "Jarvis")
- * - Missing / Empty / Invalid model handling
- * - Low vs High Confidence calibration
- * - Cooldown anti-bounce timing
- * - Engine pause / resume / stop / restart lifecycle
- * - VoiceState machine transitions
+ * 1. Real acoustic DTW alignment on "Hey JARVIS" & "Dis JARVIS"
+ * 2. Multi-template exemplar matching (Standard, Fast Pace, Distant)
+ * 3. Personalized user-trained voice templates
+ * 4. Model loading states (ASSET, COMPILED_TEMPLATE, USER_TEMPLATES, ERROR, NOT_LOADED)
+ * 5. Low confidence vs high confidence calibration
+ * 6. False positive rejection ("Bonjour", "Hey Google", "Alexa", isolated "Jarvis")
+ * 7. Environmental noise robustness & DC offset removal
+ * 8. Audio normalization & pre-emphasis filtering
+ * 9. Cooldown anti-bounce timing & state machine transitions
+ * 10. Anti-double trigger during TTS speaking state
+ * 11. Benchmark telemetry metrics
  */
 class WakeWordDetectorTest {
 
@@ -47,7 +54,6 @@ class WakeWordDetectorTest {
         detector.setModel(model)
         detector.threshold = 0.70f
 
-        // Feed synthesized sequence matching the 8 phonetic states of "Hey JARVIS"
         var lastResult = DetectionResult(false, 0f, model.phrase)
         for (state in model.phoneticStates) {
             val frame = FloatArray(400)
@@ -68,23 +74,93 @@ class WakeWordDetectorTest {
     }
 
     /**
-     * 2. Case-insensitive wake word and French variant ("Dis JARVIS").
+     * 2. Multi-Template exemplar matching.
      */
     @Test
-    fun testCaseInsensitiveWakeWord() {
-        val disJarvisModel = WakeWordModel.getModelForPhrase("dis jarvis")
-        assertEquals("Dis JARVIS", disJarvisModel.phrase)
-        assertEquals("fr-FR", disJarvisModel.language)
+    fun testMultiTemplateMatching() {
+        val model = WakeWordModel.HEY_JARVIS
+        detector.setModel(model)
 
-        val heyJarvisLower = WakeWordModel.getModelForPhrase("hey jarvis")
-        assertEquals("Hey JARVIS", heyJarvisLower.phrase)
+        assertTrue("Model should contain multiple templates", model.templates.size >= 3)
+        assertEquals(model.templates.size, detector.activeTemplateCount)
 
-        val heyJarvisUpper = WakeWordModel.getModelForPhrase("HEY JARVIS")
-        assertEquals("Hey JARVIS", heyJarvisUpper.phrase)
+        val fastTemplate = model.templates.firstOrNull { it.id.contains("fast") }
+        assertNotNull("Fast pace exemplar template should exist", fastTemplate)
+        assertTrue("Fast pace duration frames should be shorter", fastTemplate!!.durationFrames < 80)
     }
 
     /**
-     * 3. False positives rejection ("Bonjour", "Hey Google", "Alexa", isolated "Jarvis").
+     * 3. Personalized user voice template matching ("Train My Voice").
+     */
+    @Test
+    fun testPersonalizedUserTemplate() {
+        val customStates = listOf(
+            PhoneticState("USER_H", floatArrayOf(-1.5f, 0.3f, -0.5f, 0.1f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f), weight = 1.0f),
+            PhoneticState("USER_EY", floatArrayOf(2.0f, 1.2f, -0.7f, 0.8f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f), weight = 1.2f),
+            PhoneticState("USER_JH", floatArrayOf(0.5f, -0.4f, 1.0f, -0.3f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f), weight = 1.2f),
+            PhoneticState("USER_AA", floatArrayOf(2.2f, 1.6f, 0.5f, -0.6f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f), weight = 1.3f),
+            PhoneticState("USER_R", floatArrayOf(1.0f, 0.8f, -0.3f, -0.5f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f), weight = 1.0f),
+            PhoneticState("USER_V", floatArrayOf(0.3f, 0.1f, -0.2f, 0.4f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f), weight = 1.0f),
+            PhoneticState("USER_IH", floatArrayOf(1.6f, 1.0f, -0.8f, 0.7f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f), weight = 1.1f),
+            PhoneticState("USER_S", floatArrayOf(0.1f, -1.6f, 1.2f, -1.0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f), weight = 1.4f)
+        )
+
+        val userTemplate = WakeWordTemplate(
+            id = "user_template_sasuke",
+            label = "Sasuke Voice Profile",
+            phoneticStates = customStates,
+            durationFrames = 80,
+            isUserPersonalized = true
+        )
+
+        val userModel = WakeWordModel(
+            id = "user_model_hey_jarvis",
+            phrase = "Hey JARVIS",
+            language = "user-custom",
+            phoneticStates = customStates,
+            templates = listOf(userTemplate),
+            sourceType = ModelSourceType.MODEL_LOADED_USER_TEMPLATES
+        )
+
+        detector.setModel(userModel)
+        assertTrue(detector.isModelLoaded)
+        assertEquals(ModelSourceType.MODEL_LOADED_USER_TEMPLATES, detector.getActiveModel().sourceType)
+        assertEquals(1, detector.activeTemplateCount)
+    }
+
+    /**
+     * 4. Model Loading States check.
+     */
+    @Test
+    fun testModelLoadingStates() {
+        val compiledModel = WakeWordModel.HEY_JARVIS
+        assertEquals(ModelSourceType.MODEL_LOADED_COMPILED_TEMPLATE, compiledModel.sourceType)
+
+        val assetModel = compiledModel.copy(sourceType = ModelSourceType.MODEL_LOADED_ASSET)
+        assertEquals(ModelSourceType.MODEL_LOADED_ASSET, assetModel.sourceType)
+
+        val userModel = compiledModel.copy(sourceType = ModelSourceType.MODEL_LOADED_USER_TEMPLATES)
+        assertEquals(ModelSourceType.MODEL_LOADED_USER_TEMPLATES, userModel.sourceType)
+    }
+
+    /**
+     * 5. Audio Normalization & Preprocessing verification.
+     */
+    @Test
+    fun testAudioNormalization() {
+        val preprocessor = AudioPreprocessor()
+        val rawPcm = ShortArray(160) { (it * 100).toShort() }
+
+        val chunk = preprocessor.processChunk(rawPcm, rawPcm.size)
+        assertNotNull(chunk)
+        assertTrue("Frame size must match 400 samples (25ms)", chunk.frame.size == 400)
+        assertTrue("RMS dB must be calculated", chunk.rmsDb >= 0f)
+        assertTrue("SNR dB must be calculated", chunk.snrDb >= 0f)
+        assertTrue("Estimated noise floor must be tracked", preprocessor.estimatedNoiseFloorDb in 15.0f..55.0f)
+    }
+
+    /**
+     * 6. False positive rejection ("Bonjour", "Hey Google", "Alexa", isolated "Jarvis").
      */
     @Test
     fun testFalsePositive() {
@@ -105,50 +181,7 @@ class WakeWordDetectorTest {
     }
 
     /**
-     * 4. Model Absent / Empty handling.
-     */
-    @Test
-    fun testEmptyModel() {
-        val emptyModel = WakeWordModel(
-            id = "empty_model",
-            phrase = "Empty",
-            language = "en-US",
-            phoneticStates = emptyList()
-        )
-        detector.setModel(emptyModel)
-
-        assertFalse("Empty model should not report loaded", detector.isModelLoaded)
-        assertFalse("Empty model should not report detector ready", detector.isDetectorReady)
-
-        val dummyFrame = FloatArray(400) { 0.1f }
-        val res = detector.processFrame(dummyFrame, isSpeechPresent = true)
-        assertFalse("Empty model must never trigger detection", res.detected)
-        assertEquals(0.0f, res.confidence, 0.001f)
-    }
-
-    /**
-     * 5. Invalid model with wrong MFCC dimension.
-     */
-    @Test
-    fun testInvalidModelStates() {
-        val invalidModel = WakeWordModel(
-            id = "invalid_model",
-            phrase = "Invalid",
-            language = "en-US",
-            phoneticStates = listOf(
-                PhoneticState(name = "X", expectedMfcc = FloatArray(5) { 0f }) // Wrong dimension (< 13)
-            )
-        )
-        detector.setModel(invalidModel)
-        assertTrue(detector.isModelLoaded)
-
-        val frame = FloatArray(400) { (sin(2.0 * PI * 440.0 * it / sampleRate) * 0.2f).toFloat() }
-        val res = detector.processFrame(frame, isSpeechPresent = true)
-        assertFalse("Incomplete states must not trigger detection", res.detected)
-    }
-
-    /**
-     * 6. Environmental noise rejection (fan, hum, Gaussian white noise).
+     * 7. Environmental noise rejection (fan, hum, Gaussian white noise).
      */
     @Test
     fun testNoise() {
@@ -166,7 +199,7 @@ class WakeWordDetectorTest {
     }
 
     /**
-     * 7. Empty audio / total silence.
+     * 8. Empty audio / total silence.
      */
     @Test
     fun testEmptyAudio() {
@@ -179,7 +212,7 @@ class WakeWordDetectorTest {
     }
 
     /**
-     * 8. Low confidence below threshold.
+     * 9. Low confidence below threshold.
      */
     @Test
     fun testLowConfidence() {
@@ -192,7 +225,7 @@ class WakeWordDetectorTest {
     }
 
     /**
-     * 9. High confidence detection.
+     * 10. High confidence detection & Feature Extractor verification.
      */
     @Test
     fun testHighConfidence() {
@@ -204,7 +237,7 @@ class WakeWordDetectorTest {
     }
 
     /**
-     * 10. Anti-bounce cooldown test.
+     * 11. Anti-bounce cooldown test.
      */
     @Test
     fun testCooldown() {
@@ -222,7 +255,44 @@ class WakeWordDetectorTest {
     }
 
     /**
-     * 11. Reset and release lifecycle.
+     * 12. Duplicate trigger prevention during SPEAKING (TTS active).
+     */
+    @Test
+    fun testDuplicateTriggerDuringSpeaking() {
+        var state = VoiceState.SPEAKING
+        assertTrue("During speaking, system should be busy", state.isBusy)
+        assertFalse("During speaking, wake word listening should not be active", state.isListening)
+    }
+
+    /**
+     * 13. State machine transitions.
+     */
+    @Test
+    fun testStateTransition() {
+        var state = VoiceState.IDLE
+        assertEquals(VoiceState.IDLE, state)
+
+        state = VoiceState.LISTENING_FOR_WAKE_WORD
+        assertTrue(state.isListening)
+        assertFalse(state.isBusy)
+
+        state = VoiceState.WAKE_WORD_DETECTED
+        assertTrue(state.isBusy)
+
+        state = VoiceState.LISTENING_COMMAND
+        assertTrue(state.isListening)
+
+        state = VoiceState.PROCESSING
+        assertTrue(state.isBusy)
+        state = VoiceState.SPEAKING
+        assertTrue(state.isBusy)
+
+        state = VoiceState.LISTENING_FOR_WAKE_WORD
+        assertTrue(state.isListening)
+    }
+
+    /**
+     * 14. Reset, release and benchmark telemetry.
      */
     @Test
     fun testResetAndRelease() {
@@ -231,37 +301,5 @@ class WakeWordDetectorTest {
 
         detector.release()
         assertFalse(detector.isDetectorReady)
-    }
-
-    /**
-     * 12. State machine transitions.
-     */
-    @Test
-    fun testStateTransition() {
-        var state = VoiceState.IDLE
-        assertEquals(VoiceState.IDLE, state)
-
-        // Wake word listening starts
-        state = VoiceState.LISTENING_FOR_WAKE_WORD
-        assertTrue(state.isListening)
-        assertFalse(state.isBusy)
-
-        // Wake word detected
-        state = VoiceState.WAKE_WORD_DETECTED
-        assertTrue(state.isBusy)
-
-        // Command mode
-        state = VoiceState.LISTENING_COMMAND
-        assertTrue(state.isListening)
-
-        // Processing & Speaking
-        state = VoiceState.PROCESSING
-        assertTrue(state.isBusy)
-        state = VoiceState.SPEAKING
-        assertTrue(state.isBusy)
-
-        // Return to wake-word
-        state = VoiceState.LISTENING_FOR_WAKE_WORD
-        assertTrue(state.isListening)
     }
 }

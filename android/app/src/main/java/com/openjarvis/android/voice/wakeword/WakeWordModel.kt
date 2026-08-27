@@ -8,8 +8,8 @@ data class PhoneticState(
     val name: String,
     val expectedMfcc: FloatArray,
     val weight: Float = 1.0f,
-    val minFrames: Int = 3,
-    val maxFrames: Int = 20,
+    val minFrames: Int = 2,
+    val maxFrames: Int = 22,
     val minFricativeEnergy: Float = 0f,
     val minVoicingEnergy: Float = 0f
 ) {
@@ -27,47 +27,54 @@ data class PhoneticState(
 }
 
 /**
+ * Individual Acoustic Template Exemplar for Wake-Word matching.
+ * Multiple templates capture natural variations in speech rate, pitch, distance, and accent.
+ */
+data class WakeWordTemplate(
+    val id: String,
+    val label: String,
+    val phoneticStates: List<PhoneticState>,
+    val durationFrames: Int = 85,
+    val sampleRate: Int = 16000,
+    val isUserPersonalized: Boolean = false,
+    val metadata: Map<String, String> = emptyMap()
+)
+
+/**
+ * Model Source Type describing where the acoustic model was obtained.
+ */
+enum class ModelSourceType {
+    MODEL_NOT_LOADED,
+    MODEL_LOADING,
+    MODEL_LOADED_ASSET,
+    MODEL_LOADED_COMPILED_TEMPLATE,
+    MODEL_LOADED_USER_TEMPLATES,
+    MODEL_ERROR
+}
+
+/**
  * Acoustic Template Model for a Wake-Word phrase.
- * Holds sequence of phonetic states, temporal constraints, and negative rejection anchors.
+ * Holds multiple acoustic templates (exemplars), phonetic states, and metadata.
  */
 data class WakeWordModel(
     val id: String,
     val phrase: String,
     val language: String,
     val sampleRate: Int = 16000,
-    val totalExpectedFrames: Int = 90, // ~900ms duration at 10ms frame shift
+    val totalExpectedFrames: Int = 90,
     val phoneticStates: List<PhoneticState>,
-    val negativePatterns: List<List<FloatArray>> = emptyList()
+    val templates: List<WakeWordTemplate> = emptyList(),
+    val sourceType: ModelSourceType = ModelSourceType.MODEL_LOADED_COMPILED_TEMPLATE
 ) {
     companion object {
-        private const val MFCC_DIM = 13
-
-        /**
-         * Standard Acoustic Model for "Hey JARVIS" (/h eɪ  dʒ ɑː r v ɪ s/).
-         * Acoustic State Sequence:
-         * 1. /h/  - Unvoiced glottal fricative (high spectral spread, low energy)
-         * 2. /eɪ/ - Diphthong front vowel (high mid-cepstral energy, F1~500Hz, F2~2100Hz)
-         * 3. /dʒ/ - Voiced postalveolar affricate (short silence + release burst)
-         * 4. /ɑː/ - Open back unrounded vowel (high F1 ~750Hz, mid F2 ~1100Hz)
-         * 5. /r/  - Post-alveolar approximant / rhotic formant transition (F3 dip ~1700Hz)
-         * 6. /v/  - Voiced labiodental fricative (voicing bar + mid-high turbulence)
-         * 7. /ɪ/  - Near-close near-front vowel (F2 ~2000Hz)
-         * 8. /s/  - Voiceless alveolar sibilant fricative (high frequency energy > 4.5kHz)
-         */
         val HEY_JARVIS: WakeWordModel by lazy {
             createHeyJarvisModel()
         }
 
-        /**
-         * French Acoustic Model for "Dis JARVIS" (/d i  ʒ a ʁ v i s/).
-         */
         val DIS_JARVIS: WakeWordModel by lazy {
             createDisJarvisModel()
         }
 
-        /**
-         * Universal WakeWordModel registry.
-         */
         fun getModelForPhrase(phrase: String): WakeWordModel {
             val norm = phrase.trim().lowercase()
             return when {
@@ -78,8 +85,8 @@ data class WakeWordModel(
         }
 
         private fun createHeyJarvisModel(): WakeWordModel {
-            val states = listOf(
-                // 1. /h/ - Glottal onset
+            val standardStates = listOf(
+                // 1. /h/ - Glottal onset (unvoiced)
                 PhoneticState(
                     name = "H",
                     expectedMfcc = floatArrayOf(-1.8f, 0.4f, -0.6f, 0.2f, -0.3f, 0.1f, -0.2f, 0.1f, -0.1f, 0.0f, 0.1f, 0.0f, 0.0f),
@@ -149,17 +156,56 @@ data class WakeWordModel(
                 )
             )
 
+            // Fast pace variant (shorter frames, slightly higher pitch)
+            val fastStates = standardStates.map { state ->
+                state.copy(
+                    minFrames = (state.minFrames * 0.7f).toInt().coerceAtLeast(1),
+                    maxFrames = (state.maxFrames * 0.7f).toInt().coerceAtLeast(4)
+                )
+            }
+
+            // Distant / reverberant variant
+            val distantStates = standardStates.map { state ->
+                val adjustedMfcc = FloatArray(state.expectedMfcc.size) { i ->
+                    if (i == 0) state.expectedMfcc[i] * 0.8f else state.expectedMfcc[i]
+                }
+                state.copy(expectedMfcc = adjustedMfcc)
+            }
+
+            val templates = listOf(
+                WakeWordTemplate(
+                    id = "template_hey_jarvis_standard",
+                    label = "Standard Pace",
+                    phoneticStates = standardStates,
+                    durationFrames = 85
+                ),
+                WakeWordTemplate(
+                    id = "template_hey_jarvis_fast",
+                    label = "Fast Pace",
+                    phoneticStates = fastStates,
+                    durationFrames = 60
+                ),
+                WakeWordTemplate(
+                    id = "template_hey_jarvis_distant",
+                    label = "Distant / Room Acoustics",
+                    phoneticStates = distantStates,
+                    durationFrames = 90
+                )
+            )
+
             return WakeWordModel(
                 id = "model_hey_jarvis_v2",
                 phrase = "Hey JARVIS",
                 language = "en-US / fr-FR",
                 totalExpectedFrames = 85,
-                phoneticStates = states
+                phoneticStates = standardStates,
+                templates = templates,
+                sourceType = ModelSourceType.MODEL_LOADED_COMPILED_TEMPLATE
             )
         }
 
         private fun createDisJarvisModel(): WakeWordModel {
-            val states = listOf(
+            val frenchStates = listOf(
                 // 1. /d/ - Plosive
                 PhoneticState(
                     name = "D",
@@ -230,12 +276,23 @@ data class WakeWordModel(
                 )
             )
 
+            val templates = listOf(
+                WakeWordTemplate(
+                    id = "template_dis_jarvis_fr",
+                    label = "Français Standard",
+                    phoneticStates = frenchStates,
+                    durationFrames = 82
+                )
+            )
+
             return WakeWordModel(
                 id = "model_dis_jarvis_v2",
                 phrase = "Dis JARVIS",
                 language = "fr-FR",
                 totalExpectedFrames = 82,
-                phoneticStates = states
+                phoneticStates = frenchStates,
+                templates = templates,
+                sourceType = ModelSourceType.MODEL_LOADED_COMPILED_TEMPLATE
             )
         }
 
@@ -243,7 +300,8 @@ data class WakeWordModel(
             val base = createHeyJarvisModel()
             return base.copy(
                 id = "custom_${phrase.lowercase().replace(" ", "_")}",
-                phrase = phrase
+                phrase = phrase,
+                sourceType = ModelSourceType.MODEL_LOADED_COMPILED_TEMPLATE
             )
         }
     }

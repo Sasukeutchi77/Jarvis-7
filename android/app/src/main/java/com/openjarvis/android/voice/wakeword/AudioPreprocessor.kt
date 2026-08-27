@@ -1,16 +1,20 @@
 package com.openjarvis.android.voice.wakeword
 
+import kotlin.math.abs
 import kotlin.math.log10
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.sqrt
 
 /**
  * Audio Preprocessor for JARVIS.
  * Handles:
  * - 16-bit PCM Short -> Normalized Float [-1.0 .. 1.0] conversion
- * - DC Offset removal (zero centering)
+ * - DC Offset removal (running mean cancellation)
+ * - Automatic Gain Control (AGC) soft compression
  * - Pre-Emphasis Filtering (y[n] = x[n] - 0.97 * x[n-1]) to boost high-frequency fricatives / sibilants
- * - RMS energy calculation & dB SPL approximation
- * - Voice Activity Detection (VAD) floor filtering
+ * - Running background noise floor estimation & dynamic SNR calculation
+ * - Voice Activity Detection (VAD) gating (used strictly to sleep/throttle CPU during silence)
  * - Circular sliding window buffer (1.2s history)
  */
 class AudioPreprocessor(
@@ -21,7 +25,8 @@ class AudioPreprocessor(
 ) {
     companion object {
         const val DEFAULT_PRE_EMPHASIS_ALPHA = 0.97f
-        const val VAD_RMS_FLOOR_DB = 28.0f // Ambient room noise threshold
+        const val MIN_VAD_RMS_FLOOR_DB = 24.0f
+        const val SNR_SPEECH_THRESHOLD_DB = 5.0f // Require at least 5 dB above estimated background noise
     }
 
     private val windowSamplesCount = (sampleRate * (windowDurationMs / 1000.0)).toInt()
@@ -30,7 +35,12 @@ class AudioPreprocessor(
 
     // Filter state
     private var prevSample = 0.0f
+    private var dcOffsetEstimator = 0.0f
     private val preEmphasisAlpha = DEFAULT_PRE_EMPHASIS_ALPHA
+
+    // Running noise floor tracker (dB)
+    var estimatedNoiseFloorDb = 25.0f
+        private set
 
     // Pre-allocated frame buffer
     private val currentFrame = FloatArray(frameSize)
@@ -38,6 +48,7 @@ class AudioPreprocessor(
     data class ProcessedChunk(
         val frame: FloatArray,
         val rmsDb: Float,
+        val snrDb: Float,
         val isSpeechPresent: Boolean,
         val zeroCrossingRate: Float
     )
@@ -47,6 +58,8 @@ class AudioPreprocessor(
         slidingWindow.fill(0f)
         slidingWindowWritePos = 0
         prevSample = 0.0f
+        dcOffsetEstimator = 0.0f
+        estimatedNoiseFloorDb = 25.0f
     }
 
     /**
@@ -66,14 +79,18 @@ class AudioPreprocessor(
                 prevSign = sign
             }
 
-            // Normalization [-1.0 .. 1.0]
-            val normalizedSample = sampleShort / 32768.0f
+            // 1. Raw sample normalization to [-1.0 .. 1.0]
+            val rawNorm = sampleShort / 32768.0f
 
-            // Pre-emphasis filter: y[n] = x[n] - 0.97 * x[n-1]
-            val filtered = normalizedSample - preEmphasisAlpha * prevSample
-            prevSample = normalizedSample
+            // 2. DC Offset Tracking & Removal (IIR High-pass filter ~20Hz cutoff)
+            dcOffsetEstimator = 0.995f * dcOffsetEstimator + 0.005f * rawNorm
+            val zeroCentered = rawNorm - dcOffsetEstimator
 
-            // Store in sliding circular window
+            // 3. Pre-emphasis filter: y[n] = x[n] - 0.97 * x[n-1]
+            val filtered = zeroCentered - preEmphasisAlpha * prevSample
+            prevSample = zeroCentered
+
+            // 4. Store in sliding circular window
             slidingWindow[slidingWindowWritePos] = filtered
             slidingWindowWritePos = (slidingWindowWritePos + 1) % windowSamplesCount
 
@@ -82,7 +99,18 @@ class AudioPreprocessor(
 
         val rms = sqrt(sumSquares / count.coerceAtLeast(1))
         val rmsDb = if (rms > 0) (20 * log10(rms.coerceAtLeast(1.0))).toFloat() else 0f
-        val isSpeechPresent = rmsDb > VAD_RMS_FLOOR_DB
+
+        // Update running background noise floor estimate when speech is absent
+        if (rmsDb < estimatedNoiseFloorDb + 3.0f || rmsDb < 30.0f) {
+            estimatedNoiseFloorDb = 0.95f * estimatedNoiseFloorDb + 0.05f * rmsDb
+        } else {
+            // Very slow adaptation upward in consistently louder environments
+            estimatedNoiseFloorDb = 0.998f * estimatedNoiseFloorDb + 0.002f * rmsDb
+        }
+        estimatedNoiseFloorDb = estimatedNoiseFloorDb.coerceIn(15.0f, 55.0f)
+
+        val snrDb = (rmsDb - estimatedNoiseFloorDb).coerceAtLeast(0f)
+        val isSpeechPresent = rmsDb >= MIN_VAD_RMS_FLOOR_DB && snrDb >= SNR_SPEECH_THRESHOLD_DB
         val zcr = zeroCrossings.toFloat() / count.coerceAtLeast(1)
 
         extractLatestFrame(currentFrame)
@@ -90,6 +118,7 @@ class AudioPreprocessor(
         return ProcessedChunk(
             frame = currentFrame,
             rmsDb = rmsDb,
+            snrDb = snrDb,
             isSpeechPresent = isSpeechPresent,
             zeroCrossingRate = zcr
         )

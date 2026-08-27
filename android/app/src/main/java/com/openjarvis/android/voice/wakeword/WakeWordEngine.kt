@@ -10,17 +10,22 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.concurrent.CopyOnWriteArraySet
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * High-Level Wake-Word Coordinator for JARVIS.
  * Connects Audio Hardware Capture (AudioCapture) -> Preprocessing (AudioPreprocessor) -> Feature Extraction & Classifier (WakeWordDetector) -> VoiceEngine.
  *
- * Implements anti-false-trigger cooldown, audio focus handover, and full system diagnostics.
+ * Implements anti-false-trigger cooldown, audio focus handover, multi-template DTW alignment,
+ * personalized voice profile training, and full system diagnostics.
+ *
  * NOTE: RMS energy is used strictly for VAD gating to save CPU; only genuine phonetic sequence matches with confidence >= threshold trigger detection.
  */
 class WakeWordEngine(private val context: Context) {
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var ttsResumeJob: Job? = null
 
     // Subsystems
     private val audioCapture = AudioCapture(context)
@@ -33,11 +38,19 @@ class WakeWordEngine(private val context: Context) {
     private var _isPaused: Boolean = false
     private var _currentWakeWord: String = "Hey JARVIS"
     private var _sensitivity: Float = 0.5f
-    private var _modelStatus: ModelStatus = ModelStatus.UNINITIALIZED
+    private var _baseThreshold: Float = 0.75f
+    private var _isAdaptiveThresholdEnabled: Boolean = true
 
     // Cooldown to prevent multi-triggering from the same speech utterance or acoustic echo
     private var cooldownMs: Long = 2000L
     private var lastTriggerTimestamp: Long = 0L
+
+    // Telemetry & Benchmark stats
+    private var totalEvaluatedFrames = 0L
+    private var sumProcessingTimeMs = 0L
+    private var sumConfidence = 0.0
+    private var minConfidence = 1.0f
+    private var maxConfidence = 0.0f
 
     // Callbacks
     private val wakeWordListeners = CopyOnWriteArraySet<(phrase: String) -> Unit>()
@@ -54,12 +67,30 @@ class WakeWordEngine(private val context: Context) {
             rmsListeners.forEach { it(rmsDb) }
 
             if (_isRunning && !_isPaused) {
+                // Apply adaptive thresholding based on background noise
+                if (_isAdaptiveThresholdEnabled) {
+                    val noiseFloor = audioCapture.preprocessor.estimatedNoiseFloorDb
+                    val noiseAdjustment = if (noiseFloor > 35.0f) {
+                        ((noiseFloor - 35.0f) * 0.002f).coerceAtMost(0.04f)
+                    } else 0f
+                    wakeWordDetector.threshold = (_baseThreshold + noiseAdjustment).coerceIn(0.65f, 0.88f)
+                }
+
                 val result = wakeWordDetector.processFrame(frame, isSpeechPresent)
                 confidenceListeners.forEach { it(result.confidence) }
 
-                // Periodic or on-change logging for non-zero confidence to maintain clean logs
-                if (result.confidence > 0.15f) {
-                    JarvisLogger.d("WakeWordEngine", "WakeWordEngine: CONFIDENCE=${String.format("%.2f", result.confidence)}")
+                // Telemetry accumulation
+                if (isSpeechPresent) {
+                    totalEvaluatedFrames++
+                    sumProcessingTimeMs += result.processingTimeMs
+                    sumConfidence += result.confidence
+                    minConfidence = min(minConfidence, result.confidence)
+                    maxConfidence = max(maxConfidence, result.confidence)
+                }
+
+                // Controlled debug logging
+                if (result.confidence > 0.35f) {
+                    JarvisLogger.d("WakeWordEngine", "WakeWordDetector: CONFIDENCE=${String.format("%.2f", result.confidence)} (Threshold: ${String.format("%.2f", wakeWordDetector.threshold)})")
                 }
 
                 if (result.detected) {
@@ -76,15 +107,9 @@ class WakeWordEngine(private val context: Context) {
 
     private fun loadActiveModel(phrase: String) {
         JarvisLogger.i("WakeWordEngine", "WakeWordEngine: MODEL_LOADING")
-        _modelStatus = ModelStatus.MODEL_LOADING
-        val (model, status) = WakeWordModelLoader.loadModelFromAssets(context, phrase)
-        _modelStatus = status
+        val model = WakeWordModelLoader.loadModel(context, phrase)
         wakeWordDetector.setModel(model)
-        if (status == ModelStatus.MODEL_READY) {
-            JarvisLogger.i("WakeWordEngine", "WakeWordEngine: MODEL_READY for '${model.phrase}' (${model.phoneticStates.size} states)")
-        } else {
-            JarvisLogger.w("WakeWordEngine", "WakeWordEngine: MODEL_ERROR loading '${phrase}'")
-        }
+        JarvisLogger.i("WakeWordEngine", "WakeWordEngine: ${model.sourceType} for '${model.phrase}' (${wakeWordDetector.activeTemplateCount} templates)")
     }
 
     fun isRunning(): Boolean = _isRunning && !_isPaused
@@ -92,15 +117,27 @@ class WakeWordEngine(private val context: Context) {
     fun getWakeWord(): String = _currentWakeWord
     fun getSensitivity(): Float = _sensitivity
     fun getThreshold(): Float = wakeWordDetector.threshold
+    fun getBaseThreshold(): Float = _baseThreshold
     fun getLastConfidence(): Float = wakeWordDetector.lastConfidence
-    fun isModelLoaded(): Boolean = wakeWordDetector.isModelLoaded && (_modelStatus == ModelStatus.MODEL_READY)
+    fun getLastProcessingTimeMs(): Long = wakeWordDetector.lastProcessingTimeMs
+    fun getActiveTemplateCount(): Int = wakeWordDetector.activeTemplateCount
+    fun getFalsePositivesCount(): Long = wakeWordDetector.falsePositiveRejectionsCount
+    fun isModelLoaded(): Boolean = wakeWordDetector.isModelLoaded
     fun isDetectorReady(): Boolean = wakeWordDetector.isDetectorReady && isModelLoaded()
     fun isMicrophoneAvailable(): Boolean = audioCapture.hasRecordPermission()
-    fun getModelStatus(): ModelStatus = _modelStatus
+    fun getModelSourceType(): ModelSourceType = wakeWordDetector.getActiveModel().sourceType
+    fun getEstimatedNoiseFloorDb(): Float = audioCapture.preprocessor.estimatedNoiseFloorDb
+    fun isAdaptiveThresholdEnabled(): Boolean = _isAdaptiveThresholdEnabled
 
     fun isCooldownActive(): Boolean {
         val now = System.currentTimeMillis()
         return (now - lastTriggerTimestamp) < cooldownMs
+    }
+
+    fun getCooldownRemainingMs(): Long {
+        val now = System.currentTimeMillis()
+        val elapsed = now - lastTriggerTimestamp
+        return if (elapsed < cooldownMs) cooldownMs - elapsed else 0L
     }
 
     fun setWakeWord(wakeWord: String) {
@@ -111,22 +148,108 @@ class WakeWordEngine(private val context: Context) {
     }
 
     /**
-     * Map user sensitivity [0.1 .. 1.0] to internal detection threshold [0.90 .. 0.60].
-     * Higher sensitivity -> lower threshold.
+     * Map user sensitivity [0.1 .. 1.0] to base detection threshold [0.88 .. 0.62].
      */
     fun setSensitivity(sensitivity: Float) {
         _sensitivity = sensitivity.coerceIn(0.1f, 1.0f)
-        val computedThreshold = 0.90f - (_sensitivity * 0.30f)
-        wakeWordDetector.threshold = computedThreshold
-        JarvisLogger.i("WakeWordEngine", "Sensitivity set to: $_sensitivity -> Wake-Word Threshold = ${String.format("%.2f", computedThreshold)}")
+        _baseThreshold = 0.88f - (_sensitivity * 0.26f)
+        wakeWordDetector.threshold = _baseThreshold
+        JarvisLogger.i("WakeWordEngine", "Sensitivity set to: $_sensitivity -> Base Threshold = ${String.format("%.2f", _baseThreshold)}")
     }
 
     fun setThreshold(threshold: Float) {
-        wakeWordDetector.threshold = threshold.coerceIn(0.50f, 0.95f)
+        _baseThreshold = threshold.coerceIn(0.50f, 0.95f)
+        wakeWordDetector.threshold = _baseThreshold
+    }
+
+    fun setAdaptiveThresholdEnabled(enabled: Boolean) {
+        _isAdaptiveThresholdEnabled = enabled
     }
 
     fun setCooldownMs(cooldownMs: Long) {
         this.cooldownMs = cooldownMs.coerceIn(500L, 5000L)
+    }
+
+    /**
+     * Train personalized user voice templates from recorded audio frames ("Train My Voice").
+     */
+    fun trainUserVoiceTemplate(label: String, recordedFrames: List<FloatArray>): Boolean {
+        if (recordedFrames.size < 15) return false
+        val acousticFeatures = AcousticFeatures()
+
+        // Cluster and segment frames into 8 phonetic states
+        val nStates = 8
+        val framesPerState = recordedFrames.size / nStates
+        val extractedStates = mutableListOf<PhoneticState>()
+
+        for (s in 0 until nStates) {
+            val startIdx = s * framesPerState
+            val endIdx = min(recordedFrames.size, startIdx + framesPerState)
+            val avgMfcc = FloatArray(acousticFeatures.numCepstra)
+
+            for (f in startIdx until endIdx) {
+                val mfcc = FloatArray(acousticFeatures.numCepstra)
+                acousticFeatures.extractMfcc(recordedFrames[f], mfcc)
+                for (c in 0 until acousticFeatures.numCepstra) {
+                    avgMfcc[c] += mfcc[c]
+                }
+            }
+
+            val count = max(1, endIdx - startIdx)
+            for (c in 0 until acousticFeatures.numCepstra) {
+                avgMfcc[c] /= count
+            }
+
+            extractedStates.add(
+                PhoneticState(
+                    name = "P_STATE_$s",
+                    expectedMfcc = avgMfcc,
+                    weight = 1.1f,
+                    minFrames = 2,
+                    maxFrames = 18
+                )
+            )
+        }
+
+        val templateId = "user_template_${System.currentTimeMillis()}"
+        val template = WakeWordTemplate(
+            id = templateId,
+            label = label,
+            phoneticStates = extractedStates,
+            durationFrames = recordedFrames.size,
+            sampleRate = 16000,
+            isUserPersonalized = true
+        )
+
+        val saved = WakeWordModelLoader.saveUserPersonalizedTemplate(context, _currentWakeWord, template)
+        if (saved) {
+            loadActiveModel(_currentWakeWord)
+        }
+        return saved
+    }
+
+    fun clearPersonalizedTemplates(): Boolean {
+        val cleared = WakeWordModelLoader.clearUserPersonalizedTemplates(context)
+        if (cleared) {
+            loadActiveModel(_currentWakeWord)
+        }
+        return cleared
+    }
+
+    // Telemetry Benchmark metrics
+    fun getBenchmarkStats(): Map<String, Any> {
+        val avgLatency = if (totalEvaluatedFrames > 0) sumProcessingTimeMs.toFloat() / totalEvaluatedFrames else 0f
+        val avgConf = if (totalEvaluatedFrames > 0) (sumConfidence / totalEvaluatedFrames).toFloat() else 0f
+
+        return mapOf(
+            "totalEvaluatedFrames" to totalEvaluatedFrames,
+            "averageProcessingTimeMs" to avgLatency,
+            "averageConfidence" to avgConf,
+            "minConfidence" to if (totalEvaluatedFrames > 0) minConfidence else 0f,
+            "maxConfidence" to if (totalEvaluatedFrames > 0) maxConfidence else 0f,
+            "falsePositivesCount" to wakeWordDetector.falsePositiveRejectionsCount,
+            "noiseFloorDb" to audioCapture.preprocessor.estimatedNoiseFloorDb
+        )
     }
 
     fun onWakeWordDetected(listener: (phrase: String) -> Unit) {
@@ -192,6 +315,7 @@ class WakeWordEngine(private val context: Context) {
      */
     @Synchronized
     fun pause() {
+        ttsResumeJob?.cancel()
         if (!_isRunning || _isPaused) return
         _isPaused = true
         audioCapture.pause()
@@ -200,10 +324,31 @@ class WakeWordEngine(private val context: Context) {
     }
 
     /**
+     * Specialized pause during TTS to prevent audio loopback / acoustic self-triggering.
+     */
+    @Synchronized
+    fun pauseForTts() {
+        pause()
+    }
+
+    /**
+     * Resume wake-word listening with acoustic settling delay to prevent echo pickup from speaker.
+     */
+    @Synchronized
+    fun resumeAfterTts(acousticSettlingDelayMs: Long = 350L) {
+        ttsResumeJob?.cancel()
+        ttsResumeJob = scope.launch {
+            delay(acousticSettlingDelayMs)
+            resume()
+        }
+    }
+
+    /**
      * Resume wake-word listening after command completion.
      */
     @Synchronized
     fun resume() {
+        ttsResumeJob?.cancel()
         if (!_isRunning) {
             start()
             return
@@ -222,8 +367,10 @@ class WakeWordEngine(private val context: Context) {
      */
     @Synchronized
     fun stop() {
+        ttsResumeJob?.cancel()
         _isRunning = false
         _isPaused = false
+        lastTriggerTimestamp = 0L
         audioCapture.stop()
         wakeWordDetector.reset()
         notifyState(VoiceState.STOPPED)
@@ -241,7 +388,7 @@ class WakeWordEngine(private val context: Context) {
         }
 
         lastTriggerTimestamp = now
-        JarvisLogger.i("WakeWordEngine", "WakeWordEngine: WAKE_WORD_DETECTED -> '${result.phrase}' (Confidence: ${String.format("%.2f", result.confidence)})")
+        JarvisLogger.i("WakeWordEngine", "WakeWordEngine: WAKE_WORD_DETECTED -> '${result.phrase}' (Confidence: ${String.format("%.2f", result.confidence)}, Template: ${result.matchedTemplateId})")
         
         notifyState(VoiceState.WAKE_WORD_DETECTED)
 
@@ -258,7 +405,7 @@ class WakeWordEngine(private val context: Context) {
      * Manual or test trigger for the wake word.
      */
     fun triggerWakeWordDetected(phrase: String = _currentWakeWord) {
-        handleWakeWordDetection(DetectionResult(true, 1.0f, phrase))
+        handleWakeWordDetection(DetectionResult(true, 1.0f, phrase, matchedTemplateId = "manual_trigger"))
     }
 
     /**

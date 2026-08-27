@@ -15,21 +15,18 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlin.math.abs
-import kotlin.math.log10
-import kotlin.math.sqrt
 
 /**
- * Dedicated Low-Latency Audio Hardware Capture & Preprocessing for JARVIS.
- * Streams PCM 16kHz 16-bit Mono audio, performs DC offset removal, pre-emphasis,
- * RMS energy calculation, VAD gating, and sliding window frame buffering.
+ * Dedicated Low-Latency Audio Hardware Capture & Robust Preprocessing Pipeline for JARVIS.
+ * Streams PCM 16kHz 16-bit Mono audio, connects directly to AudioPreprocessor,
+ * and features automatic exponential backoff error recovery for hardware stability.
  */
 class AudioCapture(
     private val context: Context,
     val sampleRate: Int = 16000,
-    val frameSize: Int = 400,        // 25ms
-    val frameStep: Int = 160,        // 10ms
-    val windowDurationMs: Int = 1200 // 1.2s sliding acoustic analysis window
+    val frameSize: Int = 400,        // 25ms @ 16kHz
+    val frameStep: Int = 160,        // 10ms @ 16kHz
+    val windowDurationMs: Int = 1200 // 1.2s sliding window
 ) {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var captureJob: Job? = null
@@ -38,18 +35,17 @@ class AudioCapture(
     private var isRecording = false
     private var isPaused = false
 
-    // Sliding window buffer (1.2 seconds = 19200 samples)
-    private val windowSamplesCount = (sampleRate * (windowDurationMs / 1000.0)).toInt()
-    private val slidingWindow = FloatArray(windowSamplesCount)
-    private var slidingWindowWritePos = 0
-    private var totalSamplesCaptured = 0L
+    val preprocessor = AudioPreprocessor(
+        sampleRate = sampleRate,
+        frameSize = frameSize,
+        frameStep = frameStep,
+        windowDurationMs = windowDurationMs
+    )
 
-    // Pre-allocated frame buffer for listener
-    private val currentFrame = FloatArray(frameSize)
-
-    // Pre-emphasis filter state
-    private var prevSample = 0.0f
-    private val preEmphasisAlpha = 0.97f
+    // Retry recovery counter
+    private var consecutiveErrors = 0
+    private val maxConsecutiveErrors = 3
+    private var isRecovering = false
 
     // Listeners
     private var onFrameCapturedListener: ((frame: FloatArray, rmsDb: Float, isSpeechPresent: Boolean) -> Unit)? = null
@@ -59,7 +55,6 @@ class AudioCapture(
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
         private const val BUFFER_SIZE_FACTOR = 2
-        private const val VAD_RMS_FLOOR_DB = 28.0f // Threshold below which DSP classification is skipped (saves CPU)
     }
 
     fun isRecording(): Boolean = isRecording && !isPaused
@@ -73,9 +68,6 @@ class AudioCapture(
         this.onErrorListener = listener
     }
 
-    /**
-     * Check if RECORD_AUDIO permission is granted.
-     */
     fun hasRecordPermission(): Boolean {
         return ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
     }
@@ -118,36 +110,37 @@ class AudioCapture(
                 val error = "AudioRecord non initialisé (matériel audio indisponible ou occupé)"
                 JarvisLogger.e("AudioCapture", error)
                 onErrorListener?.invoke(error)
-                release()
+                releaseHardware()
                 return false
             }
 
             audioRecord?.startRecording()
             isRecording = true
             isPaused = false
+            consecutiveErrors = 0
 
             captureJob?.cancel()
             captureJob = scope.launch {
                 runCaptureLoop(bufferSize)
             }
 
-            JarvisLogger.i("AudioCapture", "AudioCapture running at $sampleRate Hz Mono.")
+            JarvisLogger.i("AudioCapture", "AudioCapture running at $sampleRate Hz Mono (Buffer: $bufferSize bytes).")
             return true
         } catch (e: SecurityException) {
             JarvisLogger.e("AudioCapture", "SecurityException during AudioRecord start", e)
             onErrorListener?.invoke("Permission microphone manquante.")
-            release()
+            releaseHardware()
             return false
         } catch (e: Exception) {
             JarvisLogger.e("AudioCapture", "Exception initializing AudioRecord", e)
             onErrorListener?.invoke("Erreur d'initialisation du microphone: ${e.message}")
-            release()
+            releaseHardware()
             return false
         }
     }
 
     /**
-     * Pause audio stream without destroying structures (e.g., during TTS or Command Recognition).
+     * Pause audio stream without destroying structures (e.g. during TTS or Command Recognition).
      */
     @Synchronized
     fun pause() {
@@ -158,13 +151,13 @@ class AudioCapture(
                 audioRecord?.stop()
             }
         } catch (e: Exception) {
-            JarvisLogger.e("AudioCapture", "Error pausing AudioRecord", e)
+            JarvisLogger.e("AudioCapture", "Error pausing AudioRecord: ${e.message}")
         }
         JarvisLogger.d("AudioCapture", "AudioCapture paused.")
     }
 
     /**
-     * Resume audio stream after command recognition finishes.
+     * Resume audio stream after command recognition or TTS finishes.
      */
     @Synchronized
     fun resume(): Boolean {
@@ -173,12 +166,13 @@ class AudioCapture(
         }
         if (isPaused) {
             try {
+                preprocessor.reset()
                 audioRecord?.startRecording()
                 isPaused = false
                 JarvisLogger.d("AudioCapture", "AudioCapture resumed.")
                 return true
             } catch (e: Exception) {
-                JarvisLogger.e("AudioCapture", "Error resuming AudioRecord", e)
+                JarvisLogger.e("AudioCapture", "Error resuming AudioRecord, attempting fresh start: ${e.message}")
                 return start()
             }
         }
@@ -194,25 +188,26 @@ class AudioCapture(
         isPaused = false
         captureJob?.cancel()
         captureJob = null
-        release()
+        releaseHardware()
+        preprocessor.reset()
         JarvisLogger.i("AudioCapture", "AudioCapture stopped.")
     }
 
-    private fun release() {
+    private fun releaseHardware() {
         try {
             if (audioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
                 audioRecord?.stop()
             }
             audioRecord?.release()
         } catch (e: Exception) {
-            JarvisLogger.e("AudioCapture", "Error releasing AudioRecord", e)
+            JarvisLogger.e("AudioCapture", "Error releasing AudioRecord: ${e.message}")
         } finally {
             audioRecord = null
         }
     }
 
     /**
-     * Core capture loop continuously reading raw PCM shorts and feeding preprocessed floats.
+     * Core capture loop reading raw PCM shorts with zero-allocation buffers.
      */
     private suspend fun runCaptureLoop(bufferSize: Int) {
         val rawBuffer = ShortArray(frameStep)
@@ -225,85 +220,41 @@ class AudioCapture(
 
             val readCount = audioRecord?.read(rawBuffer, 0, rawBuffer.size) ?: -1
             if (readCount > 0) {
-                processRawChunk(rawBuffer, readCount)
-            } else if (readCount == AudioRecord.ERROR_INVALID_OPERATION || readCount == AudioRecord.ERROR_BAD_VALUE) {
-                JarvisLogger.w("AudioCapture", "AudioRecord read error code: $readCount")
+                consecutiveErrors = 0
+                val processed = preprocessor.processChunk(rawBuffer, readCount)
+                onFrameCapturedListener?.invoke(processed.frame, processed.rmsDb, processed.isSpeechPresent)
+            } else if (readCount == AudioRecord.ERROR_INVALID_OPERATION || readCount == AudioRecord.ERROR_BAD_VALUE || readCount == AudioRecord.ERROR_DEAD_OBJECT) {
+                consecutiveErrors++
+                JarvisLogger.w("AudioCapture", "AudioRecord error code: $readCount (Attempt $consecutiveErrors/$maxConsecutiveErrors)")
+                if (consecutiveErrors >= maxConsecutiveErrors && !isRecovering) {
+                    triggerHardwareRecovery()
+                }
                 delay(50)
             }
 
-            // Yield coroutine to keep CPU overhead low and battery friendly
-            delay(5)
+            // Yield coroutine to keep CPU overhead negligible
+            delay(4)
         }
     }
 
     /**
-     * Process raw chunk: DC Offset Removal + Pre-Emphasis + Normalization + Sliding Window Update.
+     * Automatic recovery sequence: STOP -> RELEASE -> WAIT -> REINITIALIZE -> START
      */
-    private fun processRawChunk(raw: ShortArray, count: Int) {
-        var sumSquares = 0.0
-        var zeroCrossings = 0
-        var prevSign = if (raw[0] >= 0) 1 else -1
-
-        for (i in 0 until count) {
-            val sampleShort = raw[i]
-            val sign = if (sampleShort >= 0) 1 else -1
-            if (sign != prevSign) {
-                zeroCrossings++
-                prevSign = sign
+    private fun triggerHardwareRecovery() {
+        isRecovering = true
+        scope.launch {
+            JarvisLogger.w("AudioCapture", "Triggering AudioRecord hardware recovery...")
+            releaseHardware()
+            delay(300)
+            consecutiveErrors = 0
+            val restarted = start()
+            isRecovering = false
+            if (restarted) {
+                JarvisLogger.i("AudioCapture", "AudioRecord hardware recovery successful.")
+            } else {
+                JarvisLogger.e("AudioCapture", "AudioRecord hardware recovery failed.")
+                onErrorListener?.invoke("Échec de la récupération du microphone.")
             }
-
-            // Convert to normalized Float [-1.0 .. 1.0]
-            val normalizedSample = sampleShort / 32768.0f
-
-            // Apply Pre-emphasis filter: y[n] = x[n] - 0.97 * x[n-1]
-            val filtered = normalizedSample - preEmphasisAlpha * prevSample
-            prevSample = normalizedSample
-
-            // Write to circular sliding window
-            slidingWindow[slidingWindowWritePos] = filtered
-            slidingWindowWritePos = (slidingWindowWritePos + 1) % windowSamplesCount
-            totalSamplesCaptured++
-
-            sumSquares += sampleShort * sampleShort
-        }
-
-        // Compute RMS and dB level
-        val rms = sqrt(sumSquares / count)
-        val rmsDb = if (rms > 0) (20 * log10(rms.coerceAtLeast(1.0))).toFloat() else 0f
-
-        val isSpeechPresent = rmsDb > VAD_RMS_FLOOR_DB
-
-        // Extract latest frame for acoustic feature extractor
-        extractLatestFrame(currentFrame)
-
-        onFrameCapturedListener?.invoke(currentFrame, rmsDb, isSpeechPresent)
-    }
-
-    /**
-     * Copy the most recent `frameSize` samples from the circular sliding window into outFrame.
-     */
-    @Synchronized
-    fun extractLatestFrame(outFrame: FloatArray) {
-        val n = outFrame.size.coerceAtMost(windowSamplesCount)
-        var readPos = (slidingWindowWritePos - n + windowSamplesCount) % windowSamplesCount
-
-        for (i in 0 until n) {
-            outFrame[i] = slidingWindow[readPos]
-            readPos = (readPos + 1) % windowSamplesCount
-        }
-    }
-
-    /**
-     * Copy the entire sliding window (up to 1.2s) in chronological order.
-     */
-    @Synchronized
-    fun getFullSlidingWindow(outWindow: FloatArray) {
-        val n = outWindow.size.coerceAtMost(windowSamplesCount)
-        var readPos = (slidingWindowWritePos - n + windowSamplesCount) % windowSamplesCount
-
-        for (i in 0 until n) {
-            outWindow[i] = slidingWindow[readPos]
-            readPos = (readPos + 1) % windowSamplesCount
         }
     }
 }

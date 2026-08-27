@@ -14,7 +14,9 @@ data class DetectionResult(
     val detected: Boolean,
     val confidence: Float,
     val phrase: String,
+    val matchedTemplateId: String = "",
     val matchedStatesCount: Int = 0,
+    val processingTimeMs: Long = 0L,
     val timestampMs: Long = System.currentTimeMillis()
 )
 
@@ -27,6 +29,9 @@ interface IWakeWordDetector {
     val isDetectorReady: Boolean
     val lastConfidence: Float
     val lastDetectionTimestamp: Long
+    val lastProcessingTimeMs: Long
+    val activeTemplateCount: Int
+    val falsePositiveRejectionsCount: Long
 
     fun initialize(model: WakeWordModel)
     fun setModel(model: WakeWordModel)
@@ -37,29 +42,31 @@ interface IWakeWordDetector {
 }
 
 /**
- * Real on-device Acoustic Classifier for "Hey JARVIS".
- * Uses MFCC spectral feature extraction and Dynamic Time Warping (DTW) with phonetic state alignment.
+ * High-Precision Local Acoustic Template Classifier for "Hey JARVIS".
+ * Uses MFCC spectral feature extraction and Dynamic Time Warping (DTW) with multi-template exemplar alignment.
  *
- * Runs 100% locally on Android CPU with zero cloud latency and no continuous network transmission.
+ * NOTE: Runs 100% on-device (zero cloud latency, zero external data transfer).
+ * Uses real acoustic DTW matching against validated phonetic templates (Asset / User-Personalized / Compiled).
  */
 class WakeWordDetector(
     private var activeModel: WakeWordModel = WakeWordModel.HEY_JARVIS,
     override var threshold: Float = 0.75f
 ) : IWakeWordDetector {
+
     private val acousticFeatures = AcousticFeatures()
     private val mfccDim = acousticFeatures.numCepstra
 
-    // History buffer of MFCC frames (up to 120 frames = 1.2 seconds of speech)
+    // History buffer of MFCC frames (up to 120 frames = 1.2 seconds of speech at 10ms frame step)
     private val maxHistoryFrames = 120
     private val mfccHistory = Array(maxHistoryFrames) { FloatArray(mfccDim) }
     private var historyCount = 0
     private var historyWriteIndex = 0
 
-    // Pre-allocated DTW cost matrix (120 x 12)
-    private val maxModelStates = 12
+    // Pre-allocated DTW cost matrix (120 frames x 16 states max)
+    private val maxModelStates = 16
     private val dtwMatrix = Array(maxHistoryFrames + 1) { FloatArray(maxModelStates + 1) }
 
-    // Diagnostics telemetry
+    // Diagnostics & Telemetry
     override var isModelLoaded: Boolean = true
         private set
     override var isDetectorReady: Boolean = true
@@ -67,6 +74,13 @@ class WakeWordDetector(
     override var lastConfidence: Float = 0.0f
         private set
     override var lastDetectionTimestamp: Long = 0L
+        private set
+    override var lastProcessingTimeMs: Long = 0L
+        private set
+    override val activeTemplateCount: Int
+        get() = if (activeModel.templates.isNotEmpty()) activeModel.templates.size else if (activeModel.phoneticStates.isNotEmpty()) 1 else 0
+
+    override var falsePositiveRejectionsCount: Long = 0L
         private set
 
     init {
@@ -80,10 +94,11 @@ class WakeWordDetector(
     @Synchronized
     override fun setModel(model: WakeWordModel) {
         this.activeModel = model
-        this.isModelLoaded = model.phoneticStates.isNotEmpty()
-        this.isDetectorReady = isModelLoaded
+        val hasStates = model.phoneticStates.isNotEmpty() || model.templates.any { it.phoneticStates.isNotEmpty() }
+        this.isModelLoaded = hasStates
+        this.isDetectorReady = hasStates
         reset()
-        JarvisLogger.i("WakeWordDetector", "Active Wake-word Model set to: '${model.phrase}' (${model.phoneticStates.size} phonetic states)")
+        JarvisLogger.i("WakeWordDetector", "Active Wake-word Model set to: '${model.phrase}' (${model.sourceType}, ${activeTemplateCount} templates)")
     }
 
     override fun getActiveModel(): WakeWordModel = activeModel
@@ -101,19 +116,22 @@ class WakeWordDetector(
     }
 
     /**
-     * Ingest a new 25ms preprocessed audio frame and evaluate the acoustic wake-word match.
+     * Ingest a new 25ms preprocessed audio frame and evaluate acoustic wake-word match.
      * Note: Pure RMS/Energy NEVER triggers detection. Only a real acoustic alignment with
      * confidence >= threshold triggers a positive match.
      */
     @Synchronized
     override fun processFrame(frame: FloatArray, isSpeechPresent: Boolean): DetectionResult {
+        val startTimeNs = System.nanoTime()
+
         if (!isSpeechPresent) {
-            // Silence / environmental noise floor -> decay confidence smoothly
-            lastConfidence = (lastConfidence * 0.7f).coerceAtLeast(0.0f)
-            return DetectionResult(false, lastConfidence, activeModel.phrase)
+            // Silence / environmental noise floor -> smooth exponential decay of confidence
+            lastConfidence = (lastConfidence * 0.70f).coerceAtLeast(0.0f)
+            lastProcessingTimeMs = (System.nanoTime() - startTimeNs) / 1_000_000
+            return DetectionResult(false, lastConfidence, activeModel.phrase, processingTimeMs = lastProcessingTimeMs)
         }
 
-        // 1. Extract 13 MFCC coefficients for the incoming frame
+        // 1. Extract 13-dimensional MFCC vector for the incoming frame
         val currentMfcc = mfccHistory[historyWriteIndex]
         acousticFeatures.extractMfcc(frame, currentMfcc)
 
@@ -122,36 +140,68 @@ class WakeWordDetector(
             historyCount++
         }
 
-        // Need at least 25 frames (~250ms) before evaluating speech
-        if (historyCount < 25) {
-            return DetectionResult(false, 0.0f, activeModel.phrase)
+        // Need at least 25 frames (~250ms of accumulated speech) before evaluating phonetic sequence
+        if (historyCount < 25 || !isModelLoaded) {
+            lastProcessingTimeMs = (System.nanoTime() - startTimeNs) / 1_000_000
+            return DetectionResult(false, 0.0f, activeModel.phrase, processingTimeMs = lastProcessingTimeMs)
         }
 
-        // 2. Perform Dynamic Time Warping (DTW) Acoustic Sequence Alignment
-        val confidence = computeConfidenceScore()
-        lastConfidence = confidence
+        // 2. Perform Multi-Template Dynamic Time Warping (DTW) Acoustic Sequence Alignment
+        var bestConfidence = 0.0f
+        var bestTemplateId = activeModel.id
+        var bestStatesCount = activeModel.phoneticStates.size
 
-        val isDetected = confidence >= threshold
+        val templatesToEvaluate = if (activeModel.templates.isNotEmpty()) {
+            activeModel.templates
+        } else {
+            listOf(
+                WakeWordTemplate(
+                    id = activeModel.id,
+                    label = "Default",
+                    phoneticStates = activeModel.phoneticStates,
+                    durationFrames = activeModel.totalExpectedFrames
+                )
+            )
+        }
+
+        for (template in templatesToEvaluate) {
+            val conf = evaluateTemplateDtw(template)
+            if (conf > bestConfidence) {
+                bestConfidence = conf
+                bestTemplateId = template.id
+                bestStatesCount = template.phoneticStates.size
+            }
+        }
+
+        lastConfidence = bestConfidence
+        val isDetected = bestConfidence >= threshold
+
         if (isDetected) {
             lastDetectionTimestamp = System.currentTimeMillis()
-            JarvisLogger.i("WakeWordDetector", "WakeWordEngine: CONFIDENCE=${String.format("%.2f", confidence)} >= THRESHOLD=${String.format("%.2f", threshold)} -> WAKE_WORD_DETECTED ('${activeModel.phrase}')")
+            JarvisLogger.i("WakeWordDetector", "WakeWordEngine: CONFIDENCE=${String.format("%.2f", bestConfidence)} >= THRESHOLD=${String.format("%.2f", threshold)} -> WAKE_WORD_DETECTED ('${activeModel.phrase}' via $bestTemplateId)")
+        } else if (bestConfidence > 0.60f && bestConfidence < threshold) {
+            // Near-miss or rejected false candidate
+            falsePositiveRejectionsCount++
         }
+
+        lastProcessingTimeMs = (System.nanoTime() - startTimeNs) / 1_000_000
 
         return DetectionResult(
             detected = isDetected,
-            confidence = confidence,
+            confidence = bestConfidence,
             phrase = activeModel.phrase,
-            matchedStatesCount = activeModel.phoneticStates.size,
+            matchedTemplateId = bestTemplateId,
+            matchedStatesCount = bestStatesCount,
+            processingTimeMs = lastProcessingTimeMs,
             timestampMs = System.currentTimeMillis()
         )
     }
 
     /**
-     * Compute acoustic distance & probabilistic confidence score [0.00 .. 1.00]
-     * using constrained Dynamic Time Warping across phonetic states.
+     * Evaluate DTW alignment for a specific exemplar template.
      */
-    private fun computeConfidenceScore(): Float {
-        val states = activeModel.phoneticStates
+    private fun evaluateTemplateDtw(template: WakeWordTemplate): Float {
+        val states = template.phoneticStates
         val nStates = states.size
         val nFrames = min(historyCount, 100) // Evaluate recent 1.0s window
 
@@ -159,7 +209,12 @@ class WakeWordDetector(
             return 0.0f
         }
 
-        // Initialize DTW cost matrix
+        // Check bounds against preallocated DTW matrix
+        if (nFrames > maxHistoryFrames || nStates > maxModelStates) {
+            return 0.0f
+        }
+
+        // Initialize DTW cost matrix with infinity
         for (i in 0..nFrames) {
             for (j in 0..nStates) {
                 dtwMatrix[i][j] = 1e6f
@@ -167,14 +222,22 @@ class WakeWordDetector(
         }
         dtwMatrix[0][0] = 0f
 
-        // Fill DTW matrix with local slope constraints
+        // Fill DTW matrix with Sakoe-Chiba band constraints
+        val bandWidth = max(4, nFrames / 3)
+
         for (i in 1..nFrames) {
             val frameIdx = (historyWriteIndex - nFrames + (i - 1) + maxHistoryFrames) % maxHistoryFrames
             val frameMfcc = mfccHistory[frameIdx]
 
             for (j in 1..nStates) {
+                // Slope constraint check: |i - j*(nFrames/nStates)| <= bandWidth
+                val expectedFrameForState = (j.toFloat() / nStates) * nFrames
+                if (abs(i - expectedFrameForState) > bandWidth) {
+                    continue
+                }
+
                 val state = states[j - 1]
-                val localDist = computeWeightedMfccDistance(frameMfcc, state.expectedMfcc) * state.weight
+                val localDist = computeCombinedAcousticDistance(frameMfcc, state.expectedMfcc) * state.weight
 
                 val costDiag = dtwMatrix[i - 1][j - 1]
                 val costUp = dtwMatrix[i - 1][j]
@@ -186,51 +249,75 @@ class WakeWordDetector(
         }
 
         val totalCost = dtwMatrix[nFrames][nStates]
+        if (totalCost >= 1e5f) {
+            return 0.0f
+        }
+
         val normalizedCost = totalCost / (nFrames + nStates)
 
-        // Non-linear Sigmoid mapping from DTW distance to Probability Confidence [0.0 .. 1.0]
+        // Mathematical Sigmoid mapping from normalized DTW distance to probability confidence [0.0 .. 1.0]
         // Well-matched acoustic templates have normalizedCost in [0.4 .. 1.2]
         // Mismatched / noise / other phrases have normalizedCost > 2.5
-        val scale = 2.2f
-        val center = 1.4f
+        val scale = 2.4f
+        val center = 1.35f
         val rawConfidence = (1.0 / (1.0 + exp((normalizedCost - center) * scale))).toFloat()
 
-        // Apply phonetic anchoring penalties:
-        // 1. Initial syllable verification (H/EY for "Hey" or D/IY for "Dis")
-        val initialMatch = verifyInitialSyllableMatch(nFrames)
-        // 2. Final sibilant verification (/s/ for JARVIS)
-        val finalSibilantMatch = verifyFinalSibilantMatch(nFrames)
+        // Syllabic boundary checks:
+        // 1. Initial syllable verification ("Hey" / "Dis")
+        val initialMatch = verifyInitialSyllableMatch(template, nFrames)
+        // 2. Final sibilant verification (/s/ at end of JARVIS)
+        val finalSibilantMatch = verifyFinalSibilantMatch(template, nFrames)
 
-        var finalScore = rawConfidence * (0.6f + 0.2f * initialMatch + 0.2f * finalSibilantMatch)
+        // Balanced composite confidence score
+        val finalScore = rawConfidence * (0.60f + 0.20f * initialMatch + 0.20f * finalSibilantMatch)
         return finalScore.coerceIn(0.0f, 1.0f)
     }
 
     /**
-     * Distance between extracted MFCC vector and phonetic target MFCC vector.
+     * Combined Euclidean Liftered + Cosine Spectral Distance.
+     * Scale-invariant to volume differences while preserving formant spectral shape.
      */
-    private fun computeWeightedMfccDistance(a: FloatArray, b: FloatArray): Float {
-        var sum = 0f
+    private fun computeCombinedAcousticDistance(a: FloatArray, b: FloatArray): Float {
+        var dotProduct = 0.0f
+        var normA = 0.0f
+        var normB = 0.0f
+        var euclideanSum = 0.0f
+
         val n = min(a.size, b.size)
         for (i in 0 until n) {
-            val diff = a[i] - b[i]
-            // Liftering / coefficient weighting (higher cepstral indices receive modest emphasis)
-            val weight = 1.0f + 0.05f * i
-            sum += diff * diff * weight
+            val va = a[i]
+            val vb = b[i]
+
+            dotProduct += va * vb
+            normA += va * va
+            normB += vb * vb
+
+            val diff = va - vb
+            val cepstralWeight = 1.0f + 0.04f * i // Liftering
+            euclideanSum += diff * diff * cepstralWeight
         }
-        return sqrt(sum)
+
+        val denom = sqrt(normA) * sqrt(normB)
+        val cosineSimilarity = if (denom > 1e-6f) (dotProduct / denom).coerceIn(-1.0f, 1.0f) else 0.0f
+        val cosineDistance = (1.0f - cosineSimilarity) // [0.0 .. 2.0]
+
+        val euclideanDist = sqrt(euclideanSum)
+
+        // 70% Euclidean formants + 30% Cosine shape
+        return 0.70f * euclideanDist + 0.30f * cosineDistance
     }
 
     /**
      * Verify energy & spectral features of the initial syllable (prevents triggering on "Jarvis" alone).
      */
-    private fun verifyInitialSyllableMatch(nFrames: Int): Float {
+    private fun verifyInitialSyllableMatch(template: WakeWordTemplate, nFrames: Int): Float {
         val startWindow = min(20, nFrames / 3)
         var bestMatch = 0f
-        val firstStateMfcc = activeModel.phoneticStates.firstOrNull()?.expectedMfcc ?: return 1.0f
+        val firstStateMfcc = template.phoneticStates.firstOrNull()?.expectedMfcc ?: return 1.0f
 
         for (i in 0 until startWindow) {
             val frameIdx = (historyWriteIndex - nFrames + i + maxHistoryFrames) % maxHistoryFrames
-            val dist = computeWeightedMfccDistance(mfccHistory[frameIdx], firstStateMfcc)
+            val dist = computeCombinedAcousticDistance(mfccHistory[frameIdx], firstStateMfcc)
             val match = (1.0f / (1.0f + dist)).coerceIn(0f, 1f)
             if (match > bestMatch) bestMatch = match
         }
@@ -240,14 +327,14 @@ class WakeWordDetector(
     /**
      * Verify presence of final high-frequency sibilant (/s/ sound at end of JARVIS).
      */
-    private fun verifyFinalSibilantMatch(nFrames: Int): Float {
+    private fun verifyFinalSibilantMatch(template: WakeWordTemplate, nFrames: Int): Float {
         val endWindow = min(20, nFrames / 3)
         var bestMatch = 0f
-        val lastStateMfcc = activeModel.phoneticStates.lastOrNull()?.expectedMfcc ?: return 1.0f
+        val lastStateMfcc = template.phoneticStates.lastOrNull()?.expectedMfcc ?: return 1.0f
 
         for (i in (nFrames - endWindow) until nFrames) {
             val frameIdx = (historyWriteIndex - nFrames + i + maxHistoryFrames) % maxHistoryFrames
-            val dist = computeWeightedMfccDistance(mfccHistory[frameIdx], lastStateMfcc)
+            val dist = computeCombinedAcousticDistance(mfccHistory[frameIdx], lastStateMfcc)
             val match = (1.0f / (1.0f + dist)).coerceIn(0f, 1f)
             if (match > bestMatch) bestMatch = match
         }
@@ -268,7 +355,6 @@ class WakeWordDetector(
         while (offset + frameSize <= samples.size) {
             System.arraycopy(samples, offset, tempFrame, 0, frameSize)
 
-            // Calculate energy
             var sumSquares = 0.0
             for (v in tempFrame) sumSquares += v * v
             val rms = sqrt(sumSquares / frameSize)
@@ -283,4 +369,3 @@ class WakeWordDetector(
         return result
     }
 }
-

@@ -14,6 +14,7 @@ import androidx.core.content.ContextCompat
 import com.openjarvis.android.JarvisApplication
 import com.openjarvis.android.services.JarvisVoiceInteractionService
 import com.openjarvis.android.storage.SecureVault
+import com.openjarvis.android.voice.wakeword.ModelSourceType
 import java.util.Locale
 
 data class DiagnosticItem(
@@ -81,14 +82,27 @@ object VoiceDiagnostics {
         val isDetectorReady = wakeEngine.isDetectorReady()
         val currentThreshold = wakeEngine.getThreshold()
         val lastConf = wakeEngine.getLastConfidence()
-        val cooldownState = if (wakeEngine.isCooldownActive()) "ACTIF" else "PRÊT"
+        val cooldownState = if (wakeEngine.isCooldownActive()) "ACTIF (${wakeEngine.getCooldownRemainingMs()}ms)" else "PRÊT"
         val engineStatus = if (wakeEngine.isRunning()) "RUNNING" else if (wakeEngine.isPaused()) "PAUSED" else "STOPPED"
+        val modelSource = wakeEngine.getModelSourceType()
+        val activeTemplates = wakeEngine.getActiveTemplateCount()
+        val noiseFloor = wakeEngine.getEstimatedNoiseFloorDb()
+        val falseRejections = wakeEngine.getFalsePositivesCount()
+
+        val sourceLabel = when (modelSource) {
+            ModelSourceType.MODEL_LOADED_ASSET -> "MODEL_LOADED_ASSET (Fichier JSON Asset)"
+            ModelSourceType.MODEL_LOADED_COMPILED_TEMPLATE -> "MODEL_LOADED_COMPILED_TEMPLATE (Templates phonétiques compilés)"
+            ModelSourceType.MODEL_LOADED_USER_TEMPLATES -> "MODEL_LOADED_USER_TEMPLATES (Profil vocal utilisateur personnalisé)"
+            ModelSourceType.MODEL_LOADING -> "MODEL_LOADING (En cours de chargement...)"
+            ModelSourceType.MODEL_NOT_LOADED -> "MODEL_NOT_LOADED (Non chargé)"
+            ModelSourceType.MODEL_ERROR -> "MODEL_ERROR (Erreur d'initialisation)"
+        }
 
         items.add(
             DiagnosticItem(
                 title = "Moteur Wake-Word « ${wakeEngine.getWakeWord()} »",
                 isOk = config.wakeWordEnabled && isModelLoaded && isDetectorReady,
-                details = "Statut: $engineStatus | Modèle: ${if (isModelLoaded) "CHARGÉ (8 états phonétiques)" else "NON DISPONIBLE"} | Détecteur: ${if (isDetectorReady) "PRÊT (DTW/MFCC)" else "NON PRÊT"} | Seuil: ${String.format("%.2f", currentThreshold)} | Dernière confiance: ${String.format("%.2f", lastConf)} | Cooldown anti-faux déclenchement: $cooldownState",
+                details = "Statut: $engineStatus | Source: $sourceLabel | Type: Acoustic Template DTW (No Blackbox ML) | Exemplaires actifs: $activeTemplates | Seuil effectif: ${String.format("%.2f", currentThreshold)} | Dernière confiance: ${String.format("%.2f", lastConf)} | Bruit ambiant estimé: ${String.format("%.1f", noiseFloor)} dB | Rejets faux-positifs: $falseRejections | Cooldown: $cooldownState",
                 recommendation = if (!config.wakeWordEnabled) "Activez la détection 'Hey JARVIS' dans les paramètres." else if (!isModelLoaded) "Modèle acoustique non chargé." else null
             )
         )
@@ -158,19 +172,20 @@ object VoiceDiagnostics {
                 title = "Optimisation de Batterie en Arrière-plan",
                 isOk = isIgnoringBattery,
                 details = if (isIgnoringBattery) "Application exclue des restrictions de batterie (écoute permanente garantie)." else "Sous restriction de batterie (Android peut suspendre l'écoute).",
-                recommendation = if (!isIgnoringBattery) "Désactivez l'optimisation de batterie pour JARVIS dans les paramètres Android." else null
+                recommendation = if (!isIgnoringBattery) "Désactivez l'optimisation de la batterie pour JARVIS dans les paramètres Android." else null
             )
         )
 
-        val overallOk = audioGranted && recognizerAvailable && (audioRecordOk || !audioGranted)
-        val summary = if (overallOk) {
-            "Tous les sous-systèmes vocaux critiques de JARVIS sont opérationnels."
+        val allOk = items.all { it.isOk }
+        val summary = if (allOk) {
+            "Tous les sous-systèmes vocaux et matériel sont opérationnels à 100%."
         } else {
-            "Des composants vocaux nécessitent une configuration (voir détails ci-dessous)."
+            val failedCount = items.count { !it.isOk }
+            "$failedCount composant(s) vocal(aux) nécessitent une attention."
         }
 
         return VoiceDiagnosticReport(
-            overallStatus = overallOk,
+            overallStatus = allOk,
             items = items,
             summary = summary
         )
