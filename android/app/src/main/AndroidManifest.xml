@@ -73,6 +73,11 @@
             android:exported="false"
             android:foregroundServiceType="microphone" />
 
+        <!-- Floating Holographic HUD Overlay Service (SYSTEM_ALERT_WINDOW) -->
+        <service
+            android:name=".hologram.HologramOverlayService"
+            android:exported="false" />
+
         <!-- Foreground Service for Background Screen Capture & Live Vision -->
         <service
             android:name=".services.JarvisScreenCaptureService"

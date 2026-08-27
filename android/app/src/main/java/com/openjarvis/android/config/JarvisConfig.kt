@@ -22,5 +22,13 @@ data class JarvisConfig(
     val ttsVoiceProvider: String = "android_native", // "android_native", "deepgram", or "cartesia"
     val maxTurns: Int = 10,
     val ragTopK: Int = 5,
-    val lowPowerModeThreshold: Int = 20
+    val lowPowerModeThreshold: Int = 20,
+    val hologramEnabled: Boolean = true,
+    val overlayEnabled: Boolean = true,
+    val hologramTheme: String = "CYBER_CYAN",
+    val hologramQuality: String = "HIGH",
+    val hologramAutoHide: Boolean = true,
+    val hologramAutoHideDelaySec: Int = 4,
+    val hapticFeedbackEnabled: Boolean = true,
+    val activationSoundEnabled: Boolean = true
 )

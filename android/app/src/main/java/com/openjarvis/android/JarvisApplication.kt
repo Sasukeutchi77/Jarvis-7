@@ -3,6 +3,10 @@ package com.openjarvis.android
 import android.app.Application
 import com.openjarvis.android.config.ConfigManager
 import com.openjarvis.android.core.bridge.OpenJarvisCoreBridge
+import com.openjarvis.android.hologram.HologramConfig
+import com.openjarvis.android.hologram.HologramController
+import com.openjarvis.android.hologram.HologramQuality
+import com.openjarvis.android.hologram.HologramThemeColor
 import com.openjarvis.android.lifecycle.AppLifecycleManager
 import com.openjarvis.android.logging.JarvisLogger
 import com.openjarvis.android.storage.SecureVault
@@ -36,6 +40,9 @@ class JarvisApplication : Application() {
     lateinit var voiceEngine: VoiceEngine
         private set
 
+    lateinit var hologramController: HologramController
+        private set
+
     override fun onCreate() {
         super.onCreate()
         instance = this
@@ -58,12 +65,40 @@ class JarvisApplication : Application() {
         voiceEngine = VoiceEngine(this, configManager, secureVault, coreBridge)
         voiceEngine.initialize()
 
+        // Initialize Holographic HUD Controller
+        val appConfig = configManager.config.value
+        val themeColor = try {
+            HologramThemeColor.valueOf(appConfig.hologramTheme)
+        } catch (e: Exception) {
+            HologramThemeColor.CYBER_CYAN
+        }
+        val quality = try {
+            HologramQuality.valueOf(appConfig.hologramQuality)
+        } catch (e: Exception) {
+            HologramQuality.HIGH
+        }
+
+        hologramController = HologramController(this, configManager)
+        hologramController.updateConfig(
+            HologramConfig(
+                enabled = appConfig.hologramEnabled,
+                overlayEnabled = appConfig.overlayEnabled,
+                themeColor = themeColor,
+                quality = quality,
+                autoHide = appConfig.hologramAutoHide,
+                autoHideDelaySec = appConfig.hologramAutoHideDelaySec,
+                hapticFeedbackEnabled = appConfig.hapticFeedbackEnabled,
+                activationSoundEnabled = appConfig.activationSoundEnabled
+            )
+        )
+        hologramController.bindToVoiceEngine(voiceEngine)
+
         // Seed initial memories asynchronously
         CoroutineScope(Dispatchers.IO).launch {
             personalMemoryManager.seedDefaultMemoriesIfEmpty()
         }
 
-        JarvisLogger.i("Application", "OpenJarvis Android Subsystems & Personal Memory Engine initialized.")
+        JarvisLogger.i("Application", "OpenJarvis Android Subsystems, Voice & Hologram HUD Engine initialized.")
     }
 
     private fun setupUncaughtExceptionHandler() {
