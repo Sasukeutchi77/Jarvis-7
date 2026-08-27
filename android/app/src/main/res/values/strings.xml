@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">OpenJarvis</string>
+    <string name="channel_voice_service">JARVIS Voice Assistant Service</string>
+    <string name="channel_voice_service_desc">Maintains continuous voice interaction and wake-word listening.</string>
+    <string name="voice_service_running">J.A.R.V.I.S. en veille — Écoute de « Hey JARVIS »</string>
+    <string name="voice_action_stop">Arrêter JARVIS</string>
+    <string name="voice_action_speak">Parler à JARVIS</string>
+    <string name="voice_hud_listening">Écoute de votre commande...</string>
+    <string name="voice_hud_thinking">Raisonnement JARVIS...</string>
+    <string name="voice_hud_speaking">Réponse en cours...</string>
+    <string name="accessibility_service_description">Service d\'accessibilité JARVIS permettant l\'analyse contextuelle de l\'écran, la lecture et l\'automatisation d\'actions système.</string>
+    <string name="device_admin_description">Accès administrateur de l\'appareil JARVIS pour la gestion de sécurité, verrouillage, mises à jour et contrôle système complet.</string>
+</resources>

@@ -1,0 +1,6 @@
+{
+  "name": "OpenJarvis",
+  "description": "On-device AI assistant with deep Android platform integration, context awareness engine, agent orchestration, personal assistant, telephony, coding, and multi-source connectors.",
+  "requestFramePermissions": ["camera", "microphone", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
