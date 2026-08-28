@@ -1,6 +1,7 @@
 package com.openjarvis.android.core.bridge
 
 import android.content.Context
+import com.openjarvis.android.communication.JarvisCommunicationController
 import com.openjarvis.android.config.ConfigManager
 import com.openjarvis.android.config.ExecutionMode
 import com.openjarvis.android.core.engine.EngineMessage
@@ -30,7 +31,7 @@ import kotlinx.coroutines.launch
 
 /**
  * Real Core Bridge coordinating Android OS, Voice/Chat UI, Room FTS5 Memory, Native Tools,
- * and Inference Engines (Gemini Cloud + OpenJarvis LAN/Local).
+ * Communication Center, Device Controller, and Inference Engines (Gemini Cloud + OpenJarvis LAN/Local).
  */
 class OpenJarvisCoreBridge(
     private val context: Context,
@@ -47,9 +48,10 @@ class OpenJarvisCoreBridge(
     private val _lastResponse = MutableStateFlow("")
     val lastResponse: StateFlow<String> = _lastResponse.asStateFlow()
 
-    // Native Tool Registry & Device Controller
+    // Native Tool Registry, Device Controller & Communication Controller
     private val toolRegistry = ToolRegistry(context)
     val deviceController = JarvisDeviceController(context)
+    val communicationController = JarvisCommunicationController(context)
 
     // Engines
     private val geminiEngine = GeminiCloudEngine(secureVault)
@@ -59,13 +61,13 @@ class OpenJarvisCoreBridge(
     private val conversationHistory = mutableListOf<EngineMessage>()
 
     fun initialize() {
-        JarvisLogger.i("CoreBridge", "OpenJarvis Android Real Core Bridge initialized with Native Tools, Personal Memory & Dual Engine.")
+        JarvisLogger.i("CoreBridge", "OpenJarvis Android Real Core Bridge initialized with Communication Center, Device Controller, Personal Memory & Dual Engine.")
     }
 
     /**
      * Entry point for processing user requests from Voice HUD or Chat UI.
      * Implements full real flow:
-     * User -> Intent Check (Remember/Recall/Tools) -> Memory Retrieval (FTS5) -> AI Engine (SSE Stream) -> Response -> Android UI & TTS
+     * User -> Intent Check (Communication / Device / Remember / Recall / Tools) -> Memory Retrieval (FTS5) -> AI Engine (SSE Stream) -> Response -> Android UI & TTS
      */
     fun processQuery(userPrompt: String, onStreamDelta: ((String) -> Unit)? = null) {
         if (userPrompt.isBlank()) return
@@ -76,7 +78,36 @@ class OpenJarvisCoreBridge(
             JarvisEventBus.emit(JarvisEvent.UserSpeechRecognized(userPrompt, true))
 
             try {
-                // 1. Process deterministic Android System / Device / Hardware Control
+                // 1. Process deterministic Communication Intent (SMS, Notifications, Contacts, In-line Replies)
+                val commResult = communicationController.processCommand(userPrompt)
+                if (commResult != null) {
+                    val durationMs = System.currentTimeMillis() - startTime
+                    val responseText = commResult.spokenMessage
+                    
+                    updateState(AgentState.SPEAKING)
+                    _lastResponse.value = responseText
+                    onStreamDelta?.invoke(responseText)
+                    JarvisEventBus.emit(JarvisEvent.ContentStreamChunk(responseText))
+
+                    database.memoryDao().insertTrace(
+                        TraceEntity(
+                            sessionId = "comm_act_${System.currentTimeMillis()}",
+                            query = userPrompt,
+                            response = responseText,
+                            executionMode = "COMMUNICATION_CENTER",
+                            modelUsed = "JarvisCommunicationController-${commResult.actionType}",
+                            latencyMs = durationMs,
+                            tokensPrompt = 0,
+                            tokensCompletion = 0,
+                            toolsUsedJson = "[\"${commResult.actionType}\"]",
+                            isSuccess = commResult.isSuccess
+                        )
+                    )
+                    updateState(AgentState.IDLE)
+                    return@launch
+                }
+
+                // 2. Process deterministic Android System / Device / Hardware Control
                 val deviceResult = deviceController.processCommand(userPrompt)
                 if (deviceResult != null) {
                     val durationMs = System.currentTimeMillis() - startTime

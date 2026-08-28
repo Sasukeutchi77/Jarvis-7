@@ -507,6 +507,11 @@ fun SettingsScreen() {
             DeviceControlDiagnosticsCard()
         }
 
+        // JARVIS Communication Center Diagnostics & Settings (Step 5)
+        item {
+            CommunicationCenterCard()
+        }
+
         // Mode & Cloud Engine Selection
         item {
             Text(

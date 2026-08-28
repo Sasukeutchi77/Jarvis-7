@@ -159,6 +159,42 @@ class JarvisNotificationListenerService : NotificationListenerService() {
 
             CommunicationManager.handleIncomingMessage(this, incomingMessage)
 
+            try {
+                val appActions = notification.actions?.map { act ->
+                    NotificationCompat.Action.Builder(
+                        act.icon,
+                        act.title,
+                        act.actionIntent
+                    ).apply {
+                        act.remoteInputs?.forEach { ri ->
+                            addRemoteInput(
+                                androidx.core.app.RemoteInput.Builder(ri.resultKey)
+                                    .setLabel(ri.label)
+                                    .setChoices(ri.choices)
+                                    .setAllowFreeFormInput(ri.allowFreeFormInput)
+                                    .addExtras(ri.extras)
+                                    .build()
+                            )
+                        }
+                    }.build()
+                }
+
+                com.openjarvis.android.JarvisApplication.instance.communicationController.notificationController.onNotificationPosted(
+                    key = notificationKey,
+                    id = sbn.id,
+                    packageName = pkg,
+                    title = title,
+                    text = text,
+                    subText = subText,
+                    postTime = sbn.postTime.takeIf { it > 0 } ?: System.currentTimeMillis(),
+                    isGroupSummary = (notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0,
+                    groupKey = notification.group,
+                    actions = appActions
+                )
+            } catch (e: Exception) {
+                // Non-fatal if application instance is not yet ready
+            }
+
         } catch (e: Exception) {
             JarvisLogger.e("NotificationListener", "Error processing notification from $pkg", e)
         }
@@ -168,6 +204,11 @@ class JarvisNotificationListenerService : NotificationListenerService() {
         super.onNotificationRemoved(sbn)
         sbn?.key?.let { key ->
             replyActionsCache.remove(key)
+            try {
+                com.openjarvis.android.JarvisApplication.instance.communicationController.notificationController.onNotificationRemoved(key)
+            } catch (e: Exception) {
+                // Ignore if instance not ready
+            }
         }
     }
 
