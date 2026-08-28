@@ -502,6 +502,11 @@ fun SettingsScreen() {
             }
         }
 
+        // Real Android System & Hardware Control Diagnostics
+        item {
+            DeviceControlDiagnosticsCard()
+        }
+
         // Mode & Cloud Engine Selection
         item {
             Text(

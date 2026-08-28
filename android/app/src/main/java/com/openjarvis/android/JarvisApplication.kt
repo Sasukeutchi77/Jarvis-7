@@ -43,6 +43,8 @@ class JarvisApplication : Application() {
     lateinit var hologramController: HologramController
         private set
 
+    val deviceController get() = coreBridge.deviceController
+
     override fun onCreate() {
         super.onCreate()
         instance = this

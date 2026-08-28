@@ -12,6 +12,8 @@ import com.openjarvis.android.core.events.AgentState
 import com.openjarvis.android.core.events.JarvisEvent
 import com.openjarvis.android.core.events.JarvisEventBus
 import com.openjarvis.android.core.tools.ToolRegistry
+import com.openjarvis.android.device.JarvisDeviceController
+import com.openjarvis.android.device.model.ActionResultStatus
 import com.openjarvis.android.logging.JarvisLogger
 import com.openjarvis.android.storage.SecureVault
 import com.openjarvis.android.storage.database.JarvisDatabase
@@ -45,8 +47,9 @@ class OpenJarvisCoreBridge(
     private val _lastResponse = MutableStateFlow("")
     val lastResponse: StateFlow<String> = _lastResponse.asStateFlow()
 
-    // Native Tool Registry
+    // Native Tool Registry & Device Controller
     private val toolRegistry = ToolRegistry(context)
+    val deviceController = JarvisDeviceController(context)
 
     // Engines
     private val geminiEngine = GeminiCloudEngine(secureVault)
@@ -73,9 +76,38 @@ class OpenJarvisCoreBridge(
             JarvisEventBus.emit(JarvisEvent.UserSpeechRecognized(userPrompt, true))
 
             try {
+                // 1. Process deterministic Android System / Device / Hardware Control
+                val deviceResult = deviceController.processCommand(userPrompt)
+                if (deviceResult != null) {
+                    val durationMs = System.currentTimeMillis() - startTime
+                    val responseText = deviceResult.spokenMessage
+                    
+                    updateState(AgentState.SPEAKING)
+                    _lastResponse.value = responseText
+                    onStreamDelta?.invoke(responseText)
+                    JarvisEventBus.emit(JarvisEvent.ContentStreamChunk(responseText))
+
+                    database.memoryDao().insertTrace(
+                        TraceEntity(
+                            sessionId = "device_act_${System.currentTimeMillis()}",
+                            query = userPrompt,
+                            response = responseText,
+                            executionMode = "ON_DEVICE_CONTROL",
+                            modelUsed = "JarvisDeviceController-${deviceResult.actionType}",
+                            latencyMs = durationMs,
+                            tokensPrompt = 0,
+                            tokensCompletion = 0,
+                            toolsUsedJson = "[\"${deviceResult.actionType}\"]",
+                            isSuccess = deviceResult.isSuccess
+                        )
+                    )
+                    updateState(AgentState.IDLE)
+                    return@launch
+                }
+
                 val promptLower = userPrompt.lowercase().trim()
 
-                // 1. Direct explicit memory recording commands: e.g. "Rappelle-toi que...", "Mémorise que...", "Souviens-toi de..."
+                // 2. Direct explicit memory recording commands: e.g. "Rappelle-toi que...", "Mémorise que...", "Souviens-toi de..."
                 if (promptLower.startsWith("rappelle-toi que") || promptLower.startsWith("rappelle toi que") ||
                     promptLower.startsWith("souviens-toi que") || promptLower.startsWith("souviens toi que") ||
                     promptLower.startsWith("mémorise que") || promptLower.startsWith("memorise que") ||
