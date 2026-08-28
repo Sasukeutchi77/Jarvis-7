@@ -45,6 +45,7 @@ class JarvisApplication : Application() {
 
     val deviceController get() = coreBridge.deviceController
     val communicationController get() = coreBridge.communicationController
+    val memoryCore get() = coreBridge.memoryCore
 
     override fun onCreate() {
         super.onCreate()

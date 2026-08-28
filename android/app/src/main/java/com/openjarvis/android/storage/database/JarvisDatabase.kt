@@ -4,23 +4,29 @@ import android.content.Context
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import com.openjarvis.android.storage.database.dao.JarvisMemoryDao
 import com.openjarvis.android.storage.database.dao.MemoryDao
 import com.openjarvis.android.storage.database.entity.DocumentEntity
 import com.openjarvis.android.storage.database.entity.DocumentFtsEntity
+import com.openjarvis.android.storage.database.entity.MemoryEntity
+import com.openjarvis.android.storage.database.entity.MemoryFtsEntity
 import com.openjarvis.android.storage.database.entity.TraceEntity
 
 @Database(
     entities = [
         DocumentEntity::class,
         DocumentFtsEntity::class,
-        TraceEntity::class
+        TraceEntity::class,
+        MemoryEntity::class,
+        MemoryFtsEntity::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class JarvisDatabase : RoomDatabase() {
 
     abstract fun memoryDao(): MemoryDao
+    abstract fun jarvisMemoryDao(): JarvisMemoryDao
 
     companion object {
         @Volatile

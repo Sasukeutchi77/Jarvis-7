@@ -14,11 +14,11 @@ import com.openjarvis.android.core.events.JarvisEvent
 import com.openjarvis.android.core.events.JarvisEventBus
 import com.openjarvis.android.core.tools.ToolRegistry
 import com.openjarvis.android.device.JarvisDeviceController
-import com.openjarvis.android.device.model.ActionResultStatus
 import com.openjarvis.android.logging.JarvisLogger
+import com.openjarvis.android.memory.JarvisMemoryCore
 import com.openjarvis.android.storage.SecureVault
 import com.openjarvis.android.storage.database.JarvisDatabase
-import com.openjarvis.android.storage.database.entity.MemoryCategory
+import com.openjarvis.android.storage.database.entity.DocumentEntity
 import com.openjarvis.android.storage.database.entity.TraceEntity
 import com.openjarvis.android.storage.memory.PersonalMemoryManager
 import kotlinx.coroutines.CoroutineScope
@@ -31,7 +31,7 @@ import kotlinx.coroutines.launch
 
 /**
  * Real Core Bridge coordinating Android OS, Voice/Chat UI, Room FTS5 Memory, Native Tools,
- * Communication Center, Device Controller, and Inference Engines (Gemini Cloud + OpenJarvis LAN/Local).
+ * Communication Center, Device Controller, Memory Core, and Inference Engines (Gemini Cloud + OpenJarvis LAN/Local).
  */
 class OpenJarvisCoreBridge(
     private val context: Context,
@@ -48,10 +48,11 @@ class OpenJarvisCoreBridge(
     private val _lastResponse = MutableStateFlow("")
     val lastResponse: StateFlow<String> = _lastResponse.asStateFlow()
 
-    // Native Tool Registry, Device Controller & Communication Controller
+    // Native Tool Registry, Device Controller, Communication Controller & Memory Core
     private val toolRegistry = ToolRegistry(context)
     val deviceController = JarvisDeviceController(context)
     val communicationController = JarvisCommunicationController(context)
+    val memoryCore = JarvisMemoryCore(context, secureVault)
 
     // Engines
     private val geminiEngine = GeminiCloudEngine(secureVault)
@@ -61,13 +62,13 @@ class OpenJarvisCoreBridge(
     private val conversationHistory = mutableListOf<EngineMessage>()
 
     fun initialize() {
-        JarvisLogger.i("CoreBridge", "OpenJarvis Android Real Core Bridge initialized with Communication Center, Device Controller, Personal Memory & Dual Engine.")
+        JarvisLogger.i("CoreBridge", "OpenJarvis Android Real Core Bridge initialized with Memory Core (Step 6), Communication Center & Device Controller.")
     }
 
     /**
      * Entry point for processing user requests from Voice HUD or Chat UI.
      * Implements full real flow:
-     * User -> Intent Check (Communication / Device / Remember / Recall / Tools) -> Memory Retrieval (FTS5) -> AI Engine (SSE Stream) -> Response -> Android UI & TTS
+     * User -> Memory Intent Check -> Communication Intent -> Device Control Intent -> Memory Context Retrieval -> AI Engine -> TTS/UI
      */
     fun processQuery(userPrompt: String, onStreamDelta: ((String) -> Unit)? = null) {
         if (userPrompt.isBlank()) return
@@ -78,12 +79,48 @@ class OpenJarvisCoreBridge(
             JarvisEventBus.emit(JarvisEvent.UserSpeechRecognized(userPrompt, true))
 
             try {
-                // 1. Process deterministic Communication Intent (SMS, Notifications, Contacts, In-line Replies)
+                // 1. Process explicit Memory Core Commands (Remember, Forget, Search Memory, Explain, Status, Clear)
+                val memoryResult = memoryCore.processMemoryCommand(userPrompt)
+                if (memoryResult != null) {
+                    val durationMs = System.currentTimeMillis() - startTime
+                    val responseText = memoryResult.spokenMessage
+
+                    updateState(AgentState.SPEAKING)
+                    _lastResponse.value = responseText
+                    onStreamDelta?.invoke(responseText)
+                    JarvisEventBus.emit(JarvisEvent.ContentStreamChunk(responseText))
+
+                    database.memoryDao().insertTrace(
+                        TraceEntity(
+                            sessionId = "memory_act_${System.currentTimeMillis()}",
+                            query = userPrompt,
+                            response = responseText,
+                            executionMode = "MEMORY_CORE",
+                            modelUsed = "JarvisMemoryCore-${memoryResult.actionType}",
+                            latencyMs = durationMs,
+                            tokensPrompt = 0,
+                            tokensCompletion = 0,
+                            toolsUsedJson = "[\"${memoryResult.actionType}\"]",
+                            isSuccess = memoryResult.isSuccess
+                        )
+                    )
+                    updateState(AgentState.IDLE)
+                    return@launch
+                }
+
+                // 2. Process deterministic Communication Intent (SMS, Notifications, Contacts, In-line Replies)
                 val commResult = communicationController.processCommand(userPrompt)
                 if (commResult != null) {
                     val durationMs = System.currentTimeMillis() - startTime
                     val responseText = commResult.spokenMessage
-                    
+
+                    memoryCore.recordTurn(
+                        query = userPrompt,
+                        response = responseText,
+                        contact = commResult.item?.senderOrContact,
+                        intent = commResult.actionType.name
+                    )
+
                     updateState(AgentState.SPEAKING)
                     _lastResponse.value = responseText
                     onStreamDelta?.invoke(responseText)
@@ -107,12 +144,19 @@ class OpenJarvisCoreBridge(
                     return@launch
                 }
 
-                // 2. Process deterministic Android System / Device / Hardware Control
+                // 3. Process deterministic Android System / Device / Hardware Control
                 val deviceResult = deviceController.processCommand(userPrompt)
                 if (deviceResult != null) {
                     val durationMs = System.currentTimeMillis() - startTime
                     val responseText = deviceResult.spokenMessage
-                    
+
+                    memoryCore.recordTurn(
+                        query = userPrompt,
+                        response = responseText,
+                        app = deviceResult.packageName,
+                        intent = deviceResult.actionType.name
+                    )
+
                     updateState(AgentState.SPEAKING)
                     _lastResponse.value = responseText
                     onStreamDelta?.invoke(responseText)
@@ -138,17 +182,7 @@ class OpenJarvisCoreBridge(
 
                 val promptLower = userPrompt.lowercase().trim()
 
-                // 2. Direct explicit memory recording commands: e.g. "Rappelle-toi que...", "Mémorise que...", "Souviens-toi de..."
-                if (promptLower.startsWith("rappelle-toi que") || promptLower.startsWith("rappelle toi que") ||
-                    promptLower.startsWith("souviens-toi que") || promptLower.startsWith("souviens toi que") ||
-                    promptLower.startsWith("mémorise que") || promptLower.startsWith("memorise que") ||
-                    promptLower.startsWith("garde en mémoire que")
-                ) {
-                    handleExplicitMemoryCreation(userPrompt, startTime, onStreamDelta)
-                    return@launch
-                }
-
-                // 2. Quick deterministic native tool triggers (e.g. system info, battery, time)
+                // 4. Quick deterministic native tool triggers (e.g. system info, battery, time)
                 if (promptLower.contains("batterie") || promptLower.contains("battery")) {
                     executeNativeToolDirect("get_battery_status", startTime, onStreamDelta)
                     return@launch
@@ -157,19 +191,27 @@ class OpenJarvisCoreBridge(
                     return@launch
                 }
 
-                // 3. Contextual Memory Retrieval (RAG via SQLite FTS5)
-                val relevantDocs = memoryManager.retrieveContextForQuery(userPrompt, limit = 4)
-
-                if (relevantDocs.isNotEmpty()) {
-                    JarvisLogger.d("CoreBridge", "Retrieved ${relevantDocs.size} context chunks from FTS5 database.")
+                // 5. Build dynamic Memory & User Profile Context block
+                val memoryContextString = memoryCore.buildPromptContext(userPrompt)
+                val contextMemoryDocs = if (memoryContextString.isNotBlank()) {
+                    listOf(
+                        DocumentEntity(
+                            id = "ctx_mem_${System.currentTimeMillis()}",
+                            source = "JARVIS_MEMORY_CORE",
+                            content = memoryContextString,
+                            importanceScore = 1.0f
+                        )
+                    )
+                } else {
+                    emptyList()
                 }
 
-                // 4. Select appropriate Engine based on ExecutionMode & Availability
+                // 6. Select appropriate Engine based on ExecutionMode & Availability
                 val executionMode = configManager.config.value.executionMode
                 val engine: InferenceEngine = when (executionMode) {
                     ExecutionMode.LOCAL_ONLY -> lanEngine
                     ExecutionMode.CLOUD_ONLY -> geminiEngine
-                    ExecutionMode.HYBRID_AUTO -> {
+                    ExecutionMode.HYBRID, ExecutionMode.LAN_ONLY -> {
                         if (geminiEngine.isAvailable()) geminiEngine else lanEngine
                     }
                 }
@@ -188,7 +230,7 @@ class OpenJarvisCoreBridge(
 
                 engine.generateStream(
                     messages = conversationHistory,
-                    contextMemory = relevantDocs,
+                    contextMemory = contextMemoryDocs,
                     tools = toolRegistry.getAllTools().map { it.name }
                 ).collect { chunk ->
                     when (chunk) {
@@ -217,6 +259,8 @@ class OpenJarvisCoreBridge(
                 val finalResponse = responseBuilder.toString()
                 if (!hasError && finalResponse.isNotEmpty()) {
                     conversationHistory.add(EngineMessage(role = "assistant", content = finalResponse))
+                    // Record in Memory Core tiers
+                    memoryCore.recordTurn(query = userPrompt, response = finalResponse)
                 }
 
                 val durationMs = System.currentTimeMillis() - startTime
@@ -244,45 +288,6 @@ class OpenJarvisCoreBridge(
                 updateState(AgentState.IDLE)
             }
         }
-    }
-
-    private suspend fun handleExplicitMemoryCreation(
-        userPrompt: String,
-        startTime: Long,
-        onStreamDelta: ((String) -> Unit)?
-    ) {
-        val memoryFact = userPrompt
-            .replaceFirst(Regex("^(rappelle-toi que|rappelle toi que|souviens-toi que|souviens toi que|mémorise que|memorise que|garde en mémoire que)\\s*", RegexOption.IGNORE_CASE), "")
-            .trim()
-
-        val doc = memoryManager.recordMemory(
-            content = memoryFact,
-            source = "Commande Vocale Directe",
-            category = MemoryCategory.IMPORTANT_FACT,
-            importanceScore = 1.0f
-        )
-
-        val confirmMessage = "C'est bien noté Monsieur. J'ai enregistré cette information dans ma mémoire persistante FTS5 sécurisée : \"$memoryFact\"."
-        _lastResponse.value = confirmMessage
-        onStreamDelta?.invoke(confirmMessage)
-        JarvisEventBus.emit(JarvisEvent.ContentStreamChunk(confirmMessage))
-
-        val durationMs = System.currentTimeMillis() - startTime
-        database.memoryDao().insertTrace(
-            TraceEntity(
-                sessionId = "memory_write_${System.currentTimeMillis()}",
-                query = userPrompt,
-                response = confirmMessage,
-                executionMode = "ON_DEVICE_PERSISTENCE",
-                modelUsed = "FTS5-Memory-Store",
-                latencyMs = durationMs,
-                tokensPrompt = 0,
-                tokensCompletion = 0,
-                toolsUsedJson = "[\"personal_memory_manager\"]",
-                isSuccess = true
-            )
-        )
-        updateState(AgentState.IDLE)
     }
 
     private suspend fun executeNativeToolDirect(

@@ -126,6 +126,7 @@ class VoiceVisualizer {
     fun calculateSpeedMultiplier(state: HologramState): Float {
         return when (state) {
             HologramState.THINKING -> 3.2f
+            HologramState.MEMORY -> 2.4f
             HologramState.SPEAKING -> 1.8f + (_smoothedAmplitude * 1.5f)
             HologramState.LISTENING -> 1.2f + (_smoothedAmplitude * 1.8f)
             HologramState.APPEARING -> 2.0f

@@ -512,6 +512,11 @@ fun SettingsScreen() {
             CommunicationCenterCard()
         }
 
+        // JARVIS Memory Core (Étape 6) — Mémoire Conversationnelle & Long Terme Room FTS5
+        item {
+            MemoryCenterCard()
+        }
+
         // Mode & Cloud Engine Selection
         item {
             Text(

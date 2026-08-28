@@ -33,6 +33,11 @@ enum class HologramState {
     THINKING,
 
     /**
+     * Memory Core retrieval / encoding state: synaptic particle pulse & neural data flow rings.
+     */
+    MEMORY,
+
+    /**
      * Vocal response synthesis: core pulsation and harmonic wave reacting to TTS output.
      */
     SPEAKING,
