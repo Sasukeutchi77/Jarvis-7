@@ -38,6 +38,11 @@ enum class HologramState {
     MEMORY,
 
     /**
+     * Automation Engine running background scheduled tasks or routines.
+     */
+    AUTOMATION,
+
+    /**
      * Vocal response synthesis: core pulsation and harmonic wave reacting to TTS output.
      */
     SPEAKING,

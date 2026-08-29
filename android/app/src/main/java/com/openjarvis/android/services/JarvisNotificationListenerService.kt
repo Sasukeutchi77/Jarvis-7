@@ -191,6 +191,18 @@ class JarvisNotificationListenerService : NotificationListenerService() {
                     groupKey = notification.group,
                     actions = appActions
                 )
+
+                // Dispatch to Automation Engine
+                kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                    try {
+                        com.openjarvis.android.JarvisApplication.instance.automationManager.handleNotificationArrived(
+                            packageName = pkg,
+                            sender = sender,
+                            title = title,
+                            content = text
+                        )
+                    } catch (_: Exception) {}
+                }
             } catch (e: Exception) {
                 // Non-fatal if application instance is not yet ready
             }

@@ -517,6 +517,11 @@ fun SettingsScreen() {
             MemoryCenterCard()
         }
 
+        // JARVIS Automation Engine (Étape 7) — Tâches Planifiées, Routines & Déclencheurs Intelligents
+        item {
+            AutomationCenterCard()
+        }
+
         // Mode & Cloud Engine Selection
         item {
             Text(

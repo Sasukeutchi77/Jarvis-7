@@ -1,6 +1,8 @@
 package com.openjarvis.android
 
 import android.app.Application
+import com.openjarvis.android.automation.AutomationCommandRouter
+import com.openjarvis.android.automation.AutomationManager
 import com.openjarvis.android.config.ConfigManager
 import com.openjarvis.android.core.bridge.OpenJarvisCoreBridge
 import com.openjarvis.android.hologram.HologramConfig
@@ -41,6 +43,12 @@ class JarvisApplication : Application() {
         private set
 
     lateinit var hologramController: HologramController
+        private set
+
+    lateinit var automationManager: AutomationManager
+        private set
+
+    lateinit var automationCommandRouter: AutomationCommandRouter
         private set
 
     val deviceController get() = coreBridge.deviceController
@@ -96,6 +104,11 @@ class JarvisApplication : Application() {
             )
         )
         hologramController.bindToVoiceEngine(voiceEngine)
+
+        // Initialize Automation Manager & Voice Command Router
+        automationManager = AutomationManager(this, secureVault)
+        automationManager.initialize()
+        automationCommandRouter = AutomationCommandRouter(automationManager)
 
         // Seed initial memories asynchronously
         CoroutineScope(Dispatchers.IO).launch {

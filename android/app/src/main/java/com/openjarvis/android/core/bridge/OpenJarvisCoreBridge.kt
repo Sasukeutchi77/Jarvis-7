@@ -180,6 +180,42 @@ class OpenJarvisCoreBridge(
                     return@launch
                 }
 
+                // 3.5. Process Automation Engine Commands (Reminders, Timers, Alarms, Routines, Automations)
+                val autoRouter = JarvisApplication.instance.automationCommandRouter
+                val autoResult = autoRouter.handleCommand(userPrompt)
+                if (autoResult.handled) {
+                    val durationMs = System.currentTimeMillis() - startTime
+                    val responseText = autoResult.responseText ?: "Automatisation traitée."
+
+                    memoryCore.recordTurn(
+                        query = userPrompt,
+                        response = responseText,
+                        intent = "AUTOMATION_ENGINE"
+                    )
+
+                    updateState(AgentState.SPEAKING)
+                    _lastResponse.value = responseText
+                    onStreamDelta?.invoke(responseText)
+                    JarvisEventBus.emit(JarvisEvent.ContentStreamChunk(responseText))
+
+                    database.memoryDao().insertTrace(
+                        TraceEntity(
+                            sessionId = "auto_act_${System.currentTimeMillis()}",
+                            query = userPrompt,
+                            response = responseText,
+                            executionMode = "AUTOMATION_ENGINE",
+                            modelUsed = "JarvisAutomationEngine",
+                            latencyMs = durationMs,
+                            tokensPrompt = 0,
+                            tokensCompletion = 0,
+                            toolsUsedJson = "[\"AUTOMATION\"]",
+                            isSuccess = true
+                        )
+                    )
+                    updateState(AgentState.IDLE)
+                    return@launch
+                }
+
                 val promptLower = userPrompt.lowercase().trim()
 
                 // 4. Quick deterministic native tool triggers (e.g. system info, battery, time)
